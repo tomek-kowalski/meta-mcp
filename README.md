@@ -103,3 +103,21 @@ account has no campaigns.
 
 `meta_list_page_posts` gets a Page access token in memory through a GET request when needed. That token is never
 returned or logged.
+
+## Business knowledge tooling
+
+`src/knowledge/` is a generic toolkit for a separate, private knowledge repository. The repository holds website
+evidence, curated facts, a claim registry, recommendations and reports. **No business content lives in this
+repository.** Configuration comes from `.env` (see `.env.example`):
+
+- `KNOWLEDGE_DIR`: the knowledge repository. It's refused if it resolves inside this repository, the website
+  repository (`PORTFOLIO_DIR`) or the editorial store (`PUBLISHER_CONTENT_DIR`), symlinks included.
+- `KNOWLEDGE_SITE_ORIGIN`: the website to crawl.
+
+```sh
+npm run knowledge -- status
+npm run knowledge -- refresh [--dry-run] [--limit N] [--commit]
+npm run knowledge -- validate <draft-file> --lang pl [--channel facebook] [--link <url>] [--live] [--final]
+```
+
+`refresh` writes only `evidence/` and `reports/` in the knowledge repository, and never the curated files.

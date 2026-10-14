@@ -4,18 +4,19 @@
   "private": true,
   "description": "Read-only local MCP server for the Meta Graph / Marketing API (ForeachURL)",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/src/index.js",
   "bin": {
-    "meta-mcp": "dist/index.js"
+    "meta-mcp": "dist/src/index.js"
   },
   "engines": {
     "node": ">=20.12"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
+    "start": "node dist/src/index.js",
     "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
-    "smoke": "npm run build && node dist/scripts/smoke.js"
+    "smoke": "npm run build && node dist/scripts/smoke.js",
+    "knowledge": "npm run build --silent && node dist/src/knowledge/bin.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
