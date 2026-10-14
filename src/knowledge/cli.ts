@@ -1,7 +1,12 @@
 import { existsSync } from "node:fs";
 import { logError, redactString } from "../sanitize.js";
 import { readKnowledgeConfig } from "./config.js";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { normalizeText } from "./extract.js";
+import { claimEvidence, factCitations, findRecord, freshness, loadKnowledge } from "./knowledge.js";
 import { refresh } from "./refresh.js";
+import { parseSnapshot } from "./snapshot.js";
 import { knowledgePaths, loadAnonymization, loadClaims, loadManifest, loadRegistry } from "./store.js";
 
 /**
@@ -9,6 +14,8 @@ import { knowledgePaths, loadAnonymization, loadClaims, loadManifest, loadRegist
  *
  *   status                        configuration and repository health
  *   refresh [--dry-run] [--limit N] [--commit]
+ *   cite <url>#<section> [--excerpt "<verbatim text>"]   evidence reference for claims.json
+ *   check                         validate curated knowledge (claims, evidence states, fact citations)
  *   validate <file> --lang <pl|en|de> [--channel facebook|website|editorial] [--link <url>]... [--live] [--final]
  */
 
@@ -103,6 +110,79 @@ export async function runRefresh(args: ParsedArgs, out: Out = stdout): Promise<n
   return result.crawl.aborted ? 1 : 0;
 }
 
+/** Prints an evidence reference (with the section's current hash) for curating claims.json. */
+export async function cite(args: ParsedArgs, out: Out = stdout): Promise<number> {
+  const target = args.positional[0];
+  if (!target || !target.includes("#")) throw new Error("usage: cite <url>#<section> [--excerpt \"text\"]");
+  const [url, section] = [target.slice(0, target.lastIndexOf("#")), target.slice(target.lastIndexOf("#") + 1)];
+  const kb = loadKnowledge(readKnowledgeConfig());
+  const record = findRecord(kb.registry, url);
+  if (!record || record.removed_at || record.alias_of) throw new Error(`${url} is not a published page in evidence/urls.json`);
+  const sha256 = record.sections[section];
+  if (!sha256) throw new Error(`${record.url} has no section "${section}". Sections: ${Object.keys(record.sections).join(", ")}`);
+  const ref: Record<string, string> = { url: record.url, section, sha256 };
+  const excerpt = flag(args, "excerpt");
+  if (excerpt) {
+    const snapshot = parseSnapshot(readFileSync(join(knowledgePaths(kb.config.dir).pages, record.evidence_file!), "utf8"));
+    const text = normalizeText(snapshot.sections.find((s) => s.key === section)?.lines.join(" ") ?? "");
+    if (!text.includes(normalizeText(excerpt))) throw new Error(`The excerpt is not verbatim in ${record.url}#${section}`);
+    ref.excerpt = normalizeText(excerpt);
+  }
+  out.log(JSON.stringify(ref, null, 2));
+  return 0;
+}
+
+/** Validates the curated layer against the current evidence. */
+export async function check(out: Out = stdout): Promise<number> {
+  const kb = loadKnowledge(readKnowledgeConfig());
+  const paths = knowledgePaths(kb.config.dir);
+  const ids = new Set(kb.claims.map((c) => c.id));
+  let errors = 0;
+  let warnings = 0;
+  const fresh = freshness(kb.manifest, new Date(), kb.config.staleDays);
+  out.log(`evidence: last complete crawl ${fresh.lastCompleteCrawl ?? "never"}${fresh.ageDays !== null ? ` (${fresh.ageDays} days)` : ""}${fresh.stale ? "  WARNING: stale, run refresh" : ""}`);
+  if (fresh.stale) warnings += 1;
+  for (const claim of kb.claims) {
+    const ev = claimEvidence(claim, kb.registry);
+    for (const r of ev.invalid) {
+      errors += 1;
+      out.log(`ERROR claim ${claim.id}: evidence ${r.ref.url}#${r.ref.section} is ${r.state}`);
+    }
+    for (const r of ev.refs.filter((x) => x.state === "unverifiable")) {
+      warnings += 1;
+      out.log(`warning claim ${claim.id}: ${r.ref.url} could not be re-checked on the last crawl (evidence kept)`);
+    }
+  }
+  for (const term of kb.terms) {
+    if (term.claim && !ids.has(term.claim)) {
+      errors += 1;
+      out.log(`ERROR technologies.md: term "${term.term}" cites unknown claim ${term.claim}`);
+    }
+  }
+  for (const name of readdirSync(paths.facts).filter((f) => f.endsWith(".md"))) {
+    const cites = factCitations(readFileSync(join(paths.facts, name), "utf8"));
+    for (const id of cites.claims) {
+      if (!ids.has(id)) {
+        errors += 1;
+        out.log(`ERROR facts/${name}: cites unknown claim ${id}`);
+      }
+    }
+    for (const ev of cites.evidence) {
+      const record = findRecord(kb.registry, ev.url);
+      if (!record || record.removed_at || record.alias_of || !record.sections[ev.section]) {
+        errors += 1;
+        out.log(`ERROR facts/${name}: evidence ${ev.url}#${ev.section} is not a current section`);
+      }
+    }
+  }
+  if (!kb.anonymization.found) {
+    warnings += 1;
+    out.log("warning: editorial anonymization.json not found: client-name checks are off");
+  }
+  out.log(`check: ${kb.claims.length} claims, ${kb.terms.length} terms, ${errors} error(s), ${warnings} warning(s)`);
+  return errors ? 1 : 0;
+}
+
 export async function main(argv: string[], out: Out = stdout): Promise<number> {
   const args = parseArgs(argv);
   switch (args.command) {
@@ -110,8 +190,12 @@ export async function main(argv: string[], out: Out = stdout): Promise<number> {
       return status(out);
     case "refresh":
       return runRefresh(args, out);
+    case "cite":
+      return cite(args, out);
+    case "check":
+      return check(out);
     default:
-      out.error(`Unknown command "${args.command ?? ""}". Use: status | refresh | validate`);
+      out.error(`Unknown command "${args.command ?? ""}". Use: status | refresh | cite | check | validate`);
       return 2;
   }
 }
