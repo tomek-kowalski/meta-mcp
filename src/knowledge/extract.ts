@@ -89,6 +89,7 @@ const tag = (el: Element) => el.tagName.toLowerCase();
 function hidden(el: Element): boolean {
   return (
     el.hasAttribute("hidden") ||
+    el.hasAttribute("data-knowledge-unstable") ||
     el.getAttribute("aria-hidden") === "true" ||
     el.getAttribute("role") === "dialog" ||
     el.getAttribute("aria-modal") === "true"
@@ -97,18 +98,60 @@ function hidden(el: Element): boolean {
 
 /** Text of `el` that isn't inside a nested block element (blocks are emitted separately). */
 function ownText(el: Element): string {
-  let out = "";
+  const parts = new InlineRun();
   for (const node of Array.from(el.childNodes)) {
-    if (node.nodeType === 3) out += node.textContent ?? "";
+    if (node.nodeType === 3) parts.text(node.textContent ?? "");
     else if (node.nodeType === 1) {
       const child = node as Element;
       const name = tag(child);
       if (SKIP.has(name) || hidden(child)) continue;
-      if (name === "br") out += " ";
-      else if (INLINE.has(name)) out += ownText(child);
+      if (name === "br") parts.text(" ");
+      else if (INLINE.has(name)) parts.element(ownText(child));
     }
   }
-  return normalizeText(out);
+  return parts.value();
+}
+
+/**
+ * Builds inline text. Two adjacent elements get a space between them: sites
+ * often style sibling spans as separate lines ("Strony" + "WordPress"), and
+ * gluing them would invent words. Punctuation keeps its place.
+ */
+class InlineRun {
+  private out = "";
+  private lastWasElement = false;
+  text(value: string) {
+    this.out += value;
+    this.lastWasElement = false;
+  }
+  element(value: string) {
+    if (!value) return;
+    if (this.lastWasElement && !/\s$/.test(this.out) && !/^[\s,.;:!?)]/.test(value)) this.out += " ";
+    this.out += value;
+    this.lastWasElement = true;
+  }
+  value() {
+    return normalizeText(this.out);
+  }
+  reset() {
+    this.out = "";
+    this.lastWasElement = false;
+  }
+}
+
+/** Visible text of an element with blocks and sibling elements separated by spaces (for links, CTAs). */
+function flatText(el: Element): string {
+  const run = new InlineRun();
+  for (const node of Array.from(el.childNodes)) {
+    if (node.nodeType === 3) run.text(node.textContent ?? "");
+    else if (node.nodeType === 1) {
+      const child = node as Element;
+      if (SKIP.has(tag(child)) || hidden(child)) continue;
+      if (tag(child) === "br") run.text(" ");
+      else run.element(flatText(child));
+    }
+  }
+  return run.value();
 }
 
 function areaOf(el: Element): Link["area"] {
@@ -123,15 +166,16 @@ function areaOf(el: Element): Link["area"] {
 }
 
 function anchorFor(heading: Element, used: Set<string>): string | null {
-  if (heading.id && !IGNORED_IDS.has(heading.id)) return heading.id;
-  // The nearest ancestor with an id names the section, but only for its first heading.
+  // The nearest ancestor with an id names the section (that's what #links
+  // target), but only for its first heading; otherwise the heading's own id.
   for (let node = heading.parentElement; node && tag(node) !== "main" && tag(node) !== "body"; node = node.parentElement) {
     if (node.id && !IGNORED_IDS.has(node.id)) {
       const firstHeading = node.querySelector("h1, h2, h3");
-      return firstHeading === heading && !used.has(node.id) ? node.id : null;
+      if (firstHeading === heading && !used.has(node.id)) return node.id;
+      break;
     }
   }
-  return null;
+  return heading.id && !IGNORED_IDS.has(heading.id) && !used.has(heading.id) ? heading.id : null;
 }
 
 export function extractPage(html: string, pageUrl: string, origin: string): PageExtract {
@@ -173,7 +217,7 @@ export function extractPage(html: string, pageUrl: string, origin: string): Page
     const raw = a.getAttribute("href") ?? "";
     const n = normalizeUrl(raw, pageUrl, origin);
     if (!n) continue;
-    const text = normalizeText(a.textContent ?? "") || normalizeText(a.getAttribute("aria-label") ?? "");
+    const text = flatText(a) || normalizeText(a.getAttribute("aria-label") ?? "");
     const href = n.fragment ? `${n.url}#${n.fragment}` : n.url;
     const key = `${href}\u0000${text}`;
     if (seenLinks.has(key)) continue;
@@ -213,14 +257,14 @@ export function extractPage(html: string, pageUrl: string, origin: string): Page
   // Walks child nodes in document order. A run of text and inline elements is
   // one block, emitted where it occurs; block elements are walked recursively.
   const walk = (el: Element) => {
-    let run = "";
+    const run = new InlineRun();
     const flush = () => {
-      emit(run);
-      run = "";
+      emit(run.value());
+      run.reset();
     };
     for (const node of Array.from(el.childNodes)) {
       if (node.nodeType === 3) {
-        run += node.textContent ?? "";
+        run.text(node.textContent ?? "");
         continue;
       }
       if (node.nodeType !== 1) continue;
@@ -228,14 +272,15 @@ export function extractPage(html: string, pageUrl: string, origin: string): Page
       const name = tag(child);
       if (SKIP.has(name) || hidden(child)) continue;
       if (INLINE.has(name) && !child.querySelector(BLOCK_INSIDE)) {
-        run += name === "br" ? " " : ownText(child);
+        if (name === "br") run.text(" ");
+        else run.element(ownText(child));
         continue;
       }
       flush();
       const level = HEADING.exec(name);
       if (level && Number(level[1]) <= 3) {
         push(current);
-        const heading = normalizeText(child.textContent ?? "");
+        const heading = ownText(child) || normalizeText(child.textContent ?? "");
         const anchor = anchorFor(child, usedAnchors);
         if (anchor) usedAnchors.add(anchor);
         current = { key: uniqueKey(anchor ?? `h-${slugify(heading)}`), heading, level: Number(level[1]), anchor, blocks: [] };
@@ -257,7 +302,7 @@ export function extractPage(html: string, pageUrl: string, origin: string): Page
     const cls = (el.getAttribute("class") ?? "").toLowerCase();
     const isCta = tag(el) === "button" || el.getAttribute("role") === "button" || /\b(btn|button|cta)\b|btn-|cta-|_btn|_cta|button_/.test(cls);
     if (!isCta || hidden(el) || el.getAttribute("aria-expanded") !== null) continue;
-    const text = normalizeText(el.textContent ?? "") || normalizeText(el.getAttribute("aria-label") ?? "");
+    const text = flatText(el) || normalizeText(el.getAttribute("aria-label") ?? "");
     if (!text) continue;
     const raw = el.getAttribute("href");
     const n = raw ? normalizeUrl(raw, pageUrl, origin) : null;

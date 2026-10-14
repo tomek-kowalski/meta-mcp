@@ -165,6 +165,25 @@ test("extraction without <main>: body minus header, nav and footer; links still 
   assert.deepEqual(page.links.map((l) => l.area), ["header", "footer"]);
 });
 
+test("extraction: adjacent inline elements don't glue words; a section id wins over its heading's id", () => {
+  const html =
+    '<html lang="pl"><body><main><section id="strony"><h2 id="strony-title">Strony</h2>' +
+    '<a class="pill"><span>Strony</span><span>WordPress</span></a><p><strong>WooCommerce</strong>, <em>React</em> i Wo<b>rd</b>Press.</p>' +
+    '<h3 id="own">Pod</h3><p>x</p></section></main>' +
+    '<nav><a href="/o-nas"><div>O nas</div><div>Inżynieria dla e-commerce</div></a></nav></body></html>';
+  const page = extractPage(html, `${ORIGIN}/uslugi`, ORIGIN);
+  assert.deepEqual(page.sections.map((s) => s.key), ["strony", "own"]);
+  assert.deepEqual(page.sections[0].blocks, ["Strony WordPress", "WooCommerce, React i WordPress."]);
+  assert.equal(page.links[0].text, "O nas Inżynieria dla e-commerce");
+});
+
+test("extraction skips text the renderer marked unstable (animations)", () => {
+  const html = '<html lang="en"><body><main><h1>We build <span class="tw"><span data-knowledge-unstable>Scal</span></span></h1><p>Stable text.</p></main></body></html>';
+  const page = extractPage(html, `${ORIGIN}/en`, ORIGIN);
+  assert.equal(page.sections[0].heading, "We build");
+  assert.deepEqual(page.sections[0].blocks, ["Stable text."]);
+});
+
 // ---- hashing ---------------------------------------------------------------------
 
 test("hashes ignore cosmetic whitespace and markup, change with the text", () => {

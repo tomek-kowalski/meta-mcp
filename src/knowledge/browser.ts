@@ -11,6 +11,46 @@ import { chromium, type Browser, type BrowserContext } from "playwright-core";
  *   media are skipped too.
  */
 
+/**
+ * Text that changes between samples (typewriters, rotating quotes) isn't
+ * stable evidence. Three samples 1.2 s apart also catch an animation that
+ * pauses on a complete word.
+ */
+const STABILITY_SAMPLES = 3;
+const STABILITY_INTERVAL_MS = 1200;
+
+/**
+ * Samples the text of every element several times and marks the innermost
+ * elements whose text changed with data-knowledge-unstable; extract.ts skips
+ * them. Without this, animated text would produce a "change" on every crawl.
+ */
+async function markUnstableText(page: import("playwright-core").Page): Promise<void> {
+  await page.evaluate(() => {
+    const w = window as unknown as { __knowledgeText?: Map<Element, string>; __knowledgeChanged?: Set<Element> };
+    w.__knowledgeText = new Map(Array.from(document.body.querySelectorAll("*")).map((el) => [el, el.textContent ?? ""]));
+    w.__knowledgeChanged = new Set();
+  });
+  for (let i = 1; i < STABILITY_SAMPLES; i += 1) {
+    await page.waitForTimeout(STABILITY_INTERVAL_MS);
+    await page.evaluate(() => {
+      const w = window as unknown as { __knowledgeText?: Map<Element, string>; __knowledgeChanged?: Set<Element> };
+      for (const [el, text] of w.__knowledgeText ?? []) {
+        if (el.isConnected && (el.textContent ?? "") !== text) w.__knowledgeChanged?.add(el);
+      }
+    });
+  }
+  await page.evaluate(() => {
+    const w = window as unknown as { __knowledgeText?: Map<Element, string>; __knowledgeChanged?: Set<Element> };
+    const changed = w.__knowledgeChanged ?? new Set<Element>();
+    for (const el of changed) {
+      const innermost = !Array.from(el.querySelectorAll("*")).some((child) => changed.has(child));
+      if (innermost) el.setAttribute("data-knowledge-unstable", "");
+    }
+    delete w.__knowledgeText;
+    delete w.__knowledgeChanged;
+  });
+}
+
 export interface RenderResult {
   status: number | null;
   finalUrl: string;
@@ -70,6 +110,7 @@ export async function launchRenderer(opts: { origin: string; userAgent: string; 
           .waitForFunction(() => (document.querySelector("main")?.textContent?.trim().length ?? 0) > 0, undefined, { timeout: 10_000 })
           .catch(() => undefined);
         await page.waitForTimeout(300);
+        await markUnstableText(page);
         return { status: response?.status() ?? null, finalUrl: page.url(), html: await page.content() };
       } finally {
         await page.close();
