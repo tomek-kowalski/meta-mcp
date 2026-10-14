@@ -10,6 +10,7 @@ import { resolveContentDir, resolveGuardedDir } from "../publisher-config.js";
  *   KNOWLEDGE_DIR              knowledge repository (default: sibling ../knowledge)
  *   KNOWLEDGE_SITE_ORIGIN      website origin to crawl, e.g. https://example.com (required to crawl/validate URLs)
  *   KNOWLEDGE_TEXT_RESOURCES   plain-text resources to keep as evidence, "path=lang" comma-separated (e.g. /llms.txt=en)
+ *   KNOWLEDGE_EXTRA_PATHS      paths to verify on every crawl besides the sitemap, comma-separated (e.g. known aliases)
  *   KNOWLEDGE_USER_AGENT       crawler User-Agent (default: meta-mcp-knowledge/<version> (+<origin>))
  *   KNOWLEDGE_MIN_DELAY_MS     delay between page requests, at least 2000 (default 2000)
  *   KNOWLEDGE_MAX_PAGES        crawl cap (default 100)
@@ -25,6 +26,7 @@ export interface KnowledgeConfig {
   dir: string;
   origin: string | undefined;
   textResources: { path: string; lang: string }[];
+  extraPaths: string[];
   userAgent: string;
   minDelayMs: number;
   maxPages: number;
@@ -64,6 +66,15 @@ export function parseTextResources(raw: string | undefined): { path: string; lan
   });
 }
 
+export function parseExtraPaths(raw: string | undefined): string[] {
+  if (!raw?.trim()) return [];
+  return raw.split(",").map((entry) => {
+    const path = entry.trim();
+    if (!/^\/[A-Za-z0-9._\-/]*$/.test(path)) throw new ConfigError(`KNOWLEDGE_EXTRA_PATHS entry "${entry}" must be a path such as /alias.`);
+    return path;
+  });
+}
+
 export function resolveKnowledgeDir(env: NodeJS.ProcessEnv = process.env, projectRoot: string = PROJECT_ROOT): string {
   const portfolio = resolveGuardedDir({
     envVar: "PORTFOLIO_DIR",
@@ -98,6 +109,7 @@ export function readKnowledgeConfig(env: NodeJS.ProcessEnv = process.env, projec
     dir: resolveKnowledgeDir(env, projectRoot),
     origin,
     textResources: parseTextResources(env.KNOWLEDGE_TEXT_RESOURCES),
+    extraPaths: parseExtraPaths(env.KNOWLEDGE_EXTRA_PATHS),
     userAgent:
       env.KNOWLEDGE_USER_AGENT?.trim() ||
       `meta-mcp-knowledge/${KNOWLEDGE_TOOL_VERSION} (+${origin ?? "unconfigured"})`,

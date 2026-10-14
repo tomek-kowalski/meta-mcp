@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { logError, redactString } from "../sanitize.js";
 import { readKnowledgeConfig } from "./config.js";
+import { refresh } from "./refresh.js";
 import { knowledgePaths, loadAnonymization, loadClaims, loadManifest, loadRegistry } from "./store.js";
 
 /**
@@ -76,11 +77,39 @@ export async function status(out: Out = stdout): Promise<number> {
   return problems ? 1 : 0;
 }
 
+const flag = (args: ParsedArgs, name: string) => args.flags.get(name)?.at(-1);
+
+export async function runRefresh(args: ParsedArgs, out: Out = stdout): Promise<number> {
+  const config = readKnowledgeConfig();
+  const limitRaw = flag(args, "limit");
+  const limit = limitRaw === undefined ? undefined : Number(limitRaw);
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) throw new Error("--limit must be a positive integer");
+  const dryRun = flag(args, "dry-run") === "true";
+  const commit = flag(args, "commit") === "true";
+  if (dryRun && commit) throw new Error("--dry-run and --commit can't be combined");
+  const result = await refresh(
+    config,
+    { dryRun, limit, commit, extraPaths: config.extraPaths },
+    { log: (line) => out.error(line) },
+  );
+  if (dryRun) out.log(result.report);
+  const ok = result.crawl.outcomes.filter((o) => o.ok).length;
+  const failed = result.crawl.outcomes.length - ok;
+  out.log(`refresh: ${ok} ok, ${failed} failed, ${result.crawl.skipped.length} skipped${result.crawl.aborted ? `, ABORTED: ${result.crawl.aborted}` : ""}`);
+  if (result.reportFile) out.log(`report: ${result.reportFile}`);
+  if (result.written.length) out.log(`written: ${result.written.length} generated file(s)`);
+  if (dryRun) out.log("dry run: nothing was written");
+  if (commit) out.log(result.commit ? `committed ${result.commit} in the knowledge repository (local only)` : "nothing to commit");
+  return result.crawl.aborted ? 1 : 0;
+}
+
 export async function main(argv: string[], out: Out = stdout): Promise<number> {
   const args = parseArgs(argv);
   switch (args.command) {
     case "status":
       return status(out);
+    case "refresh":
+      return runRefresh(args, out);
     default:
       out.error(`Unknown command "${args.command ?? ""}". Use: status | refresh | validate`);
       return 2;
