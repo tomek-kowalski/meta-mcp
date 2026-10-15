@@ -127,7 +127,11 @@ function printSummary(out: Out, s: service.ApprovalSummary) {
 
 export async function main(argv: string[], out: Out = stdout, deps: CliDeps = defaultDeps()): Promise<number> {
   const { command, file, flags } = parseArgs(argv);
-  const options = cliOptions.parse(flags);
+  const parsedOptions = cliOptions.safeParse(flags);
+  if (!parsedOptions.success) {
+    throw new Error(parsedOptions.error.issues.map((i) => (i.path.length ? `--${i.path.join(".")}: ${i.message}` : i.message)).join("; "));
+  }
+  const options = parsedOptions.data;
   const need = () => {
     if (!file) throw new Error(`usage: npm run content -- ${command} <file.txt>`);
     return file;

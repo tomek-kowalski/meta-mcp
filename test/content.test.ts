@@ -415,6 +415,15 @@ test("CLI options: --lang and --facebook-lang validated, file name positional or
   assert.throws(() => cliOptions.parse({ unknown: "x" }));
 });
 
+test("CLI: an invalid language is reported as a readable message, not a schema dump", async () => {
+  const unused = () => {
+    throw new Error("not used");
+  };
+  const deps = { paths: sandbox().paths, content: content(), site: unused, facebook: unused } as CliDeps;
+  const out = { log: () => {}, error: () => {} };
+  await assert.rejects(main(["ingest", "a.txt", "--facebook-lang", "fr"], out, deps), (err: Error) => /^--facebook-lang: /.test(err.message) && !err.message.includes("{"));
+});
+
 test("CLI approve: refused without the owner's terminal; the typed code must match", async () => {
   const s = sandbox();
   writeFileSync(join(s.paths.inboxDir, "a.txt"), SOURCE);
