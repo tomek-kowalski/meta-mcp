@@ -17,7 +17,9 @@
     "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
     "smoke": "npm run build && node dist/scripts/smoke.js",
     "knowledge": "npm run build --silent && node dist/src/knowledge/bin.js",
-    "publisher": "npm run build --silent && node dist/src/publisher/bin.js"
+    "publisher": "npm run build --silent && node dist/src/publisher/bin.js",
+    "content": "npm run build --silent && node dist/src/content/bin.js",
+    "content:ingest": "npm run build --silent && node dist/src/content/bin.js ingest"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

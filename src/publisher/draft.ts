@@ -8,17 +8,19 @@ import { resolveContentDir, resolveGuardedDir } from "../publisher-config.js";
 /**
  * An article draft in the private editorial store:
  *
- *   <editorial>/articles/<id>/
+ *   <editorial>/drafts/<name>/       <name> = the source file's name (inbox/<name>.txt)
+ *     source.txt           the original source material, unchanged (never published)
  *     case.md              private notes on the real case (never published)
  *     meta.json            date, category, slug/title/excerpt per language, Facebook languages
  *     article.pl.md        body, Polish (primary)
  *     article.en.md        body, English
  *     article.de.md        body, German
  *     facebook.pl.txt      Facebook post (Polish by default; en/de only when the owner chooses)
- *     check.json           written by `npm run publisher -- check <id>`
+ *     check.json           written by the checks
+ *     state.json           lifecycle, approval and publication state (src/content/lifecycle.ts)
  *
- * Every article is published in all three languages; Facebook gets Polish
- * unless the owner chooses otherwise for that post.
+ * Every article is published in all three languages; the Facebook post is in
+ * exactly one language, chosen by the owner (Polish by default).
  */
 
 export const LANGUAGES = ["pl", "en", "de"] as const;
@@ -31,7 +33,8 @@ const localized = z
 
 export const draftMeta = z
   .object({
-    id: z.string().regex(/^\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*$/, "id: <date>-<polish slug>"),
+    /** The draft's name: its folder, taken from the source file name */
+    id: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "id: the draft name (lowercase words joined by hyphens)"),
     date: z.iso.date(),
     category: z.string().min(1),
     pl: localized,
@@ -51,11 +54,16 @@ export interface Draft {
   meta: DraftMeta;
   bodies: Record<Language, string | null>;
   facebook: Partial<Record<Language, string>>;
+  /** source.txt, when the draft came from the inbox: claims are checked against it */
+  source: string | null;
 }
 
 export interface PublisherPaths {
   editorialDir: string;
-  articlesDir: string;
+  inboxDir: string;
+  draftsDir: string;
+  rejectedDir: string;
+  logsDir: string;
   portfolioDir: string;
 }
 
@@ -63,7 +71,10 @@ export function publisherPaths(env: NodeJS.ProcessEnv = process.env, projectRoot
   const editorialDir = resolveContentDir(env, projectRoot);
   return {
     editorialDir,
-    articlesDir: join(editorialDir, "articles"),
+    inboxDir: join(editorialDir, "inbox"),
+    draftsDir: join(editorialDir, "drafts"),
+    rejectedDir: join(editorialDir, "rejected"),
+    logsDir: join(editorialDir, "logs"),
     portfolioDir: resolveGuardedDir({ envVar: "PORTFOLIO_DIR", value: env.PORTFOLIO_DIR, defaultDir: join(projectRoot, "..", "portfolio"), forbidden: [] }),
   };
 }
@@ -73,7 +84,7 @@ const read = (file: string) => (existsSync(file) ? readFileSync(file, "utf8") : 
 /** Loads a draft; meta.json must exist and parse (anything else is reported by the checks). */
 export function loadDraft(paths: PublisherPaths, id: string): Draft {
   if (!/^[a-z0-9-]+$/.test(id)) throw new ConfigError(`Invalid draft id "${id}"`);
-  const dir = join(paths.articlesDir, id);
+  const dir = join(paths.draftsDir, id);
   const metaText = read(join(dir, "meta.json"));
   if (metaText === null) throw new ConfigError(`No draft ${id}: ${join(dir, "meta.json")} not found`);
   let raw: unknown;
@@ -92,13 +103,13 @@ export function loadDraft(paths: PublisherPaths, id: string): Draft {
     const text = read(join(dir, `facebook.${l}.txt`));
     if (text !== null) facebook[l] = text;
   }
-  return { id, dir, meta: parsed.data, bodies, facebook };
+  return { id, dir, meta: parsed.data, bodies, facebook, source: read(join(dir, "source.txt")) };
 }
 
 export function listDrafts(paths: PublisherPaths): string[] {
-  if (!existsSync(paths.articlesDir)) return [];
-  return readdirSync(paths.articlesDir, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && existsSync(join(paths.articlesDir, d.name, "meta.json")))
+  if (!existsSync(paths.draftsDir)) return [];
+  return readdirSync(paths.draftsDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && existsSync(join(paths.draftsDir, d.name, "meta.json")))
     .map((d) => d.name)
     .sort();
 }

@@ -19,10 +19,12 @@ export class MetaApiError extends Error {
   readonly subcode?: number;
   readonly type?: string;
   readonly fbtraceId?: string;
+  /** The request may not have reached Meta, or its answer was lost: for a write, the outcome is unknown. */
+  readonly network?: boolean;
 
   constructor(
     message: string,
-    details: { status?: number; code?: number; subcode?: number; type?: string; fbtraceId?: string } = {},
+    details: { status?: number; code?: number; subcode?: number; type?: string; fbtraceId?: string; network?: boolean } = {},
   ) {
     super(redactString(message));
     this.name = "MetaApiError";
@@ -109,18 +111,43 @@ export class MetaClient {
     return body.access_token;
   }
 
-  private async request(path: string, query: Query, tokenOverride?: string): Promise<unknown> {
+  /**
+   * The only write this client can make: a text/link post on a Page's feed
+   * (POST /{page-id}/feed with message and link), with the Page's own token.
+   * Returns the new post id. A network failure is thrown with `network: true`
+   * (the post may exist: check before retrying).
+   */
+  async postPageFeed(pageId: string, post: { message: string; link: string }, pageToken: string): Promise<{ id: string }> {
+    if (!/^\d{1,32}$/.test(pageId)) throw new Error("Invalid Page ID");
+    if (!post.message.trim()) throw new Error("A post needs a message");
+    if (!/^https:\/\//.test(post.link)) throw new Error("A post link must be an https URL");
+    const form = new URLSearchParams({ message: post.message, link: post.link });
+    const result = (await this.request(`${pageId}/feed`, {}, pageToken, form)) as { id?: unknown };
+    if (typeof result.id !== "string" || !result.id) {
+      throw new MetaApiError("Meta answered without a post id: the outcome is unknown", { network: true });
+    }
+    return { id: result.id };
+  }
+
+  private async request(path: string, query: Query, tokenOverride?: string, form?: URLSearchParams): Promise<unknown> {
     const url = this.buildUrl(path, query);
+    // the only write allowed is a Page feed post
+    if (form && !/^\d{1,32}\/feed$/.test(path)) throw new Error(`Refusing to write to ${path}`);
     let res: Response;
     try {
       res = await this.fetchImpl(url, {
-        method: "GET",
-        headers: { Authorization: `Bearer ${tokenOverride ?? this.token}`, Accept: "application/json" },
+        method: form ? "POST" : "GET",
+        headers: {
+          Authorization: `Bearer ${tokenOverride ?? this.token}`,
+          Accept: "application/json",
+          ...(form ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+        },
+        ...(form ? { body: form.toString() } : {}),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (err) {
       const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-      throw new MetaApiError(`Network error calling Meta Graph API (${path}): ${msg}`);
+      throw new MetaApiError(`Network error calling Meta Graph API (${path}): ${msg}`, { network: true });
     }
 
     const text = await res.text();

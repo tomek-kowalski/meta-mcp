@@ -122,9 +122,9 @@ export async function main(argv: string[], out: Out = stdout, env: NodeJS.Proces
   const paths = publisherPaths(env);
   if (command === "list") {
     const ids = listDrafts(paths);
-    if (!ids.length) out.log(`no drafts in ${paths.articlesDir}`);
+    if (!ids.length) out.log(`no drafts in ${paths.draftsDir}`);
     for (const draftId of ids) {
-      const checkFile = join(paths.articlesDir, draftId, "check.json");
+      const checkFile = join(paths.draftsDir, draftId, "check.json");
       let state = "not checked";
       if (existsSync(checkFile)) {
         const check = readJson(checkFile) as CheckResult;

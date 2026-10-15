@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadDotEnv, readConfig } from "./config.js";
 import { logError } from "./sanitize.js";
+import { registerContentTools } from "./content/tools.js";
 import {
   createContext,
   getCampaignInput,
@@ -16,7 +17,7 @@ import {
   type ToolContext,
 } from "./tools.js";
 
-/** Every tool is read-only: Graph API GET requests only. */
+/** The Meta tools are read-only: Graph API GET requests only. (Publishing goes through the content tools.) */
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
 
 export function createServer(ctx: ToolContext): McpServer {
@@ -114,6 +115,9 @@ export function createServer(ctx: ToolContext): McpServer {
     },
     (args) => run(() => handlers.meta_list_page_posts(ctx, args)),
   );
+
+  // The content workflow: TXT intake, drafts, checks, approval-gated publishing.
+  registerContentTools(server);
 
   return server;
 }

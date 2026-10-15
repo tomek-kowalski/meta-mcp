@@ -19,5 +19,5 @@ build/
 Thumbs.db
 # Editorial content is confidential and lives outside this public repo
 # (PUBLISHER_CONTENT_DIR). Never commit it here.
-editorial/
-content/
+/editorial/
+/content/

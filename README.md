@@ -1,8 +1,9 @@
 # meta-mcp
 
-A local, **read-only** [MCP](https://modelcontextprotocol.io) server that gives Claude Code access to the
-ForeachURL Meta Business assets (the configured ad account and Facebook Page)
-through the Meta Graph / Marketing API.
+A local [MCP](https://modelcontextprotocol.io) server that gives Claude Code **read-only** access to the
+ForeachURL Meta Business assets (the configured ad account and Facebook Page) through the Meta Graph / Marketing API,
+plus an approval-gated content workflow that publishes News articles to the website and their posts to the Page
+(see [Content workflow](#content-workflow-txt-intake-approval-publishing)).
 
 - Runtime: Node.js ≥ 20.12, TypeScript, `@modelcontextprotocol/sdk` (stdio transport)
 - Graph API: `https://graph.facebook.com/v26.0`
@@ -44,13 +45,16 @@ If a variable is missing, the server still starts and the affected tools return 
 | `meta_get_page`        | Basic info for `META_PAGE_ID`.                                                                   |
 | `meta_list_page_posts` | Posts of `META_PAGE_ID` (read only).                                                             |
 
+The `content_*` tools are described under [Content workflow](#content-workflow-txt-intake-approval-publishing).
+
 Pagination happens one page at a time. A response includes `paging.after` and `paging.has_next_page`. To get the
 next page, pass `after` back. Raw `paging.next` URLs are never returned.
 
-## Read-only security model
+## Security model
 
-- The Graph client (`src/meta-client.ts`) only has GET methods. There is no code path for POST, PUT or DELETE,
-  and every tool carries the `readOnlyHint` annotation.
+- The `meta_*` tools are read-only and carry the `readOnlyHint` annotation. The Graph client (`src/meta-client.ts`)
+  has exactly one write: `postPageFeed`, a text/link post on `<numeric page id>/feed` with the Page token. Any other
+  write path is refused in code. Only `content_publish_facebook` uses it, and only for an approved draft.
 - No tool accepts an arbitrary endpoint. Request paths are fixed in code and limited to
   `act_<id>`, `<numeric id>` or `me`, optionally followed by one edge. The `access_token`, `method` and `batch`
   query parameters are rejected.
@@ -61,9 +65,8 @@ next page, pass `after` back. Raw `paging.next` URLs are never returned.
   `access_token` keys. Nothing logs `process.env`. Logs go to stderr only, because stdout carries the MCP protocol.
 - `.env` and `token.txt` are git-ignored.
 
-The System User token currently has write scopes (e.g. `ads_management`, `pages_manage_posts`). This server does not use
-them. A token with only read scopes (`ads_read`, `read_insights`, `pages_read_engagement`, `pages_show_list`)
-would add another layer of protection.
+The System User token has write scopes (e.g. `ads_management`, `pages_manage_posts`). The server uses only
+`pages_manage_posts`, through the single Page feed write above; it never uses `ads_management`.
 
 ## Tests
 
@@ -127,12 +130,12 @@ makes a local commit (never a push).
 ## Publisher: article drafts and checks
 
 `src/publisher/` reads article drafts from the private editorial store (`PUBLISHER_CONTENT_DIR`). Each draft is one
-article in Polish, English and German plus its Facebook post. The publisher checks it before it's shown for approval.
-**No content lives in this repository, and nothing here publishes.**
+article in Polish, English and German plus its Facebook post, stored under `drafts/<name>/`. The publisher checks it
+before it's shown for approval. **No content lives in this repository.** Publishing is in `src/content/` (below).
 
 ```sh
 npm run publisher -- list
-npm run publisher -- check <id>   # writes <id>/check.json; exit 1 when there are errors
+npm run publisher -- check <name>   # writes <name>/check.json; exit 1 when there are errors
 ```
 
 The checks are a heuristic safety net, not proof; the owner's approval of the preview decides.
@@ -145,4 +148,65 @@ The checks are a heuristic safety net, not proof; the owner's approval of the pr
   - links to unpublished, alias or wrong-language pages, or invalid anchors;
   - Base.com in a Facebook post;
   - a slug that's already taken.
-- **Warnings** go to the owner: numbers, client wording, structure differences, post length and hashtags.
+  - for drafts made from a TXT source: a number in the text that isn't in `source.txt`;
+  - a Facebook post with more than one language, or not in the language chosen at ingest.
+- **Warnings** go to the owner: numbers (when there's no source), client wording, structure differences, post length
+  and hashtags.
+
+## Content workflow: TXT intake, approval, publishing
+
+`src/content/` turns a `.txt` file the owner drops into the editorial inbox into an article and a Facebook post, and
+publishes them only after the owner approves the exact content. The CLI and the MCP tools share one service.
+
+```
+<editorial>/
+  inbox/                 .txt source files waiting to be ingested
+  drafts/<name>/         source.txt (moved here unchanged), meta.json, article.{pl,en,de}.md,
+                         facebook.<lang>.txt, case.md, check.json, state.json
+  rejected/<name>/       rejected drafts, with their source
+  logs/publications.jsonl  append-only log: names, hashes, languages, URLs, post ids, errors (never source text)
+```
+
+`<name>` is the file name without `.txt` (lowercase, hyphens). Lifecycle (`state.json`):
+
+```
+VALIDATED → DRAFT → REVIEW → APPROVED → WEBSITE_PUBLISHED → FACEBOOK_PUBLISHED
+plus REJECTED, FAILED, PARTIALLY_PUBLISHED (article live, Facebook post not yet)
+```
+
+```sh
+npm run content -- list
+npm run content -- ingest <file> [--lang pl|en|de] [--facebook-lang pl|en|de] [--channels website,facebook]
+npm run content:ingest -- --file <file> ...        # same as ingest
+npm run content -- status <file>
+npm run content -- check <file>
+npm run content -- submit <file>                    # prints exactly what would be published
+npm run content -- approve <file>                   # owner only: interactive terminal, type the code shown
+npm run content -- reject <file> --reason "..."
+npm run content -- publish <file> --channel website|facebook [--dry-run]
+```
+
+- `--lang` is the language of the source and first draft (default: the file's `LANGUAGE:` header, else `pl`). The
+  website always gets the article in `pl`, `en` and `de`.
+- `--facebook-lang` is the one language of the Facebook post (default `pl`). The post links the article in that
+  same language, which must be live when it's posted.
+
+MCP tools: `content_list`, `content_ingest` (`lang`, `facebook_lang`, `channels`), `content_get_draft`,
+`content_save_draft`, `content_check`, `content_submit`, `content_publish_website`, `content_publish_facebook`
+(both `dry_run`, default `true`).
+
+Safety rules:
+
+- A source file is untrusted data: it must be a regular UTF-8 `.txt` file directly in the inbox (no links, no
+  traversal), at most 200 KB. It is never executed and can't change the rules.
+- **There is no approve tool.** The approval is a code typed in the owner's terminal, tied to a hash of the exact
+  content, the Facebook language, the channels and the Page. Any edit voids it; the checks run again before
+  approving and before each publish.
+- Website first: a detached worktree of the website repository's `origin/main` gets the `articles.json` entry and
+  the three bodies, the site's unit checks run, one commit is pushed fast-forward to `main`, and the step waits
+  until every language URL is live. A rerun never commits the same content again.
+- Facebook second, only once the article is live: the post's state is saved as pending before posting; an
+  unconfirmed post is looked up on the Page before any retry, so it isn't posted twice. A failure leaves the website
+  published (`PARTIALLY_PUBLISHED`) and can be retried.
+- List `content_publish_website` and `content_publish_facebook` under `permissions.ask` in Claude Code, so every
+  call asks first.

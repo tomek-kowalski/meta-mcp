@@ -27,6 +27,7 @@ function draft(overrides: Partial<Draft> = {}): Draft {
     },
     bodies: { pl: body("Wstęp."), en: body("Intro."), de: body("Einleitung.") },
     facebook: { pl: "Kiedy zadanie w tle się nie powiedzie, warto je ponowić. Pokazujemy jak." },
+    source: null,
     ...overrides,
   };
 }
@@ -183,7 +184,7 @@ test("check: loads the draft and context from disk, writes check.json tied to th
   const portfolio = join(root, "portfolio");
   const knowledge = join(root, "knowledge");
   const id = "2026-10-20-ponawianie-zadan";
-  const dir = join(editorial, "articles", id);
+  const dir = join(editorial, "drafts", id);
   mkdirSync(dir, { recursive: true });
   mkdirSync(join(portfolio, "src", "components", "News"), { recursive: true });
   mkdirSync(join(knowledge, "evidence"), { recursive: true });

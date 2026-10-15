@@ -89,6 +89,14 @@ const SECRET_PATTERNS: [string, RegExp][] = [
 // Values that are clearly placeholders in example code.
 const PLACEHOLDER = /^(?:\*+|x+|\.+|<[^>]+>|\$\{?[A-Za-z_]+\}?|%[A-Za-z_]+%|your[-_a-z]*|example[-_a-z]*|changeme|secret|password|placeholder|dummy|test|xxx.*)$/i;
 
+/** Names of the secret kinds found in a text (e.g. in source material, to warn before drafting). */
+export function secretsIn(text: string): string[] {
+  return SECRET_PATTERNS.filter(([, re]) => {
+    const m = re.exec(text);
+    return m !== null && !(m[1] !== undefined && PLACEHOLDER.test(m[1]));
+  }).map(([name]) => name);
+}
+
 const NUMBER_CLAIMS: [string, RegExp][] = [
   ["percentage", /\d+(?:[.,]\d+)?\s?%/g],
   ["count with a plus", /\b\d+\s?\+(?=\s|$|[.,;:)])/g],
@@ -114,7 +122,6 @@ export function checkDraft(draft: Draft, ctx: CheckContext): Finding[] {
 
   // identity, category, slugs
   if (meta.id !== draft.id) error("meta.id", `meta.json id "${meta.id}" doesn't match the folder "${draft.id}"`);
-  if (!draft.id.startsWith(`${meta.date}-`)) warn("meta.id", `id doesn't start with the date ${meta.date}`);
   if (!ctx.categories.includes(meta.category)) error("meta.category", `unknown category "${meta.category}"; use one of: ${ctx.categories.join(", ")}`);
   const existing = ctx.published.find((a) => a.slug === meta.pl.slug);
   if (existing) warn("published", `an article with the Polish slug "${meta.pl.slug}" is already published: publishing this would update it`);
@@ -151,9 +158,10 @@ export function checkDraft(draft: Draft, ctx: CheckContext): Finding[] {
     }
   }
 
-  // Facebook posts: the chosen languages, Polish by default
+  // The Facebook post: exactly one language, chosen by the owner (Polish by default)
   const fbLanguages = meta.facebook.languages;
-  if (!fbLanguages.includes("pl")) warn("facebook.language", `Facebook languages are ${fbLanguages.join(", ")}: Polish is the default, confirm this choice`);
+  if (fbLanguages.length !== 1) error("facebook.language", `a Facebook post has exactly one language; meta.json lists ${fbLanguages.join(", ")}`);
+  else if (fbLanguages[0] !== "pl") warn("facebook.language", `the Facebook post is in ${fbLanguages[0]}: Polish is the default, confirm this choice`);
   for (const l of fbLanguages) {
     const post = draft.facebook[l];
     if (post === undefined || !post.trim()) {
@@ -209,10 +217,13 @@ export function checkDraft(draft: Draft, ctx: CheckContext): Finding[] {
       if (t.facebook) error("base-com", "Base.com must never be mentioned on Facebook", t.where);
       else warn("base-com", "Base.com is mentioned: public use needs the owner's explicit authorization", t.where);
     }
-    // numbers and case-study claims: must come from the case
+    // numbers and case-study claims: must come from the case. With the
+    // source material at hand, a number that isn't in it is an error.
     for (const [name, re] of NUMBER_CLAIMS) {
       for (const m of t.prose.matchAll(re)) {
-        warn("claim.number", `${name} "${m[0].trim()}": confirm it comes from the real case: "${excerpt(t.prose, m.index ?? 0, m[0].length)}"`, t.where);
+        const context = excerpt(t.prose, m.index ?? 0, m[0].length);
+        if (draft.source === null) warn("claim.number", `${name} "${m[0].trim()}": confirm it comes from the real case: "${context}"`, t.where);
+        else if (!inSource(m[0], draft.source)) error("claim.source", `${name} "${m[0].trim()}" doesn't appear in the source material: "${context}"`, t.where);
       }
     }
     const cs = CASE_STUDY.exec(t.prose);
@@ -227,6 +238,16 @@ export function checkDraft(draft: Draft, ctx: CheckContext): Finding[] {
     warn("links.stale", `the website link registry is ${ctx.registryAgeDays ?? "never"} days old: refresh recommended (npm run knowledge -- refresh)`);
   }
   return findings;
+}
+
+/** Is a number claim (e.g. "40%", "3 000 zł", "2x") backed by the same number in the source? */
+export function inSource(claim: string, source: string): boolean {
+  // "3 000" and "3000" are the same number; "1,5" and "1.5" too
+  const normalize = (text: string) => text.replace(/(\d)[  ](?=\d{3}(?!\d))/g, "$1").replace(/(\d),(\d)/g, "$1.$2");
+  const numbers = normalize(claim).match(/\d+(?:\.\d+)?/g);
+  if (!numbers) return true;
+  const haystack = normalize(source);
+  return numbers.every((n) => new RegExp("(?<![\\d.])" + n.replace(".", "\\.") + "(?![\\d])").test(haystack));
 }
 
 /** The draft's own article URL in a language (not published yet, so not in the registry). */

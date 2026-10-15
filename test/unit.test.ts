@@ -220,7 +220,7 @@ test("client refuses arbitrary paths and credential query params", () => {
   assert.throws(() => new MetaClient({ token: FAKE_TOKEN, apiVersion: "v26.0/../x" }));
 });
 
-test("MetaClient exposes no write methods", () => {
-  const proto = Object.getOwnPropertyNames(MetaClient.prototype);
-  for (const m of ["post", "put", "delete", "patch"]) assert.ok(!proto.includes(m), m);
+test("MetaClient's only write method is postPageFeed", () => {
+  const writes = Object.getOwnPropertyNames(MetaClient.prototype).filter((m) => /post|put|delete|patch|create|update|send|publish/i.test(m));
+  assert.deepEqual(writes, ["postPageFeed"]);
 });
