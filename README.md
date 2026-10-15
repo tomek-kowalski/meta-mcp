@@ -123,3 +123,26 @@ npm run knowledge -- refresh [--dry-run] [--limit N] [--commit]
 
 `refresh` writes only `evidence/` in that repository. A failed or partial crawl never removes a URL, and `--commit`
 makes a local commit (never a push).
+
+## Publisher: article drafts and checks
+
+`src/publisher/` reads article drafts from the private editorial store (`PUBLISHER_CONTENT_DIR`). Each draft is one
+article in Polish, English and German plus its Facebook post. The publisher checks it before it's shown for approval.
+**No content lives in this repository, and nothing here publishes.**
+
+```sh
+npm run publisher -- list
+npm run publisher -- check <id>   # writes <id>/check.json; exit 1 when there are errors
+```
+
+The checks are a heuristic safety net, not proof; the owner's approval of the preview decides.
+
+- **Errors** block publishing:
+  - secrets, including inside code;
+  - terms from the editorial never-publish list (`anonymization.json`);
+  - brand spelling;
+  - a missing language, or code that differs between languages;
+  - links to unpublished, alias or wrong-language pages, or invalid anchors;
+  - Base.com in a Facebook post;
+  - a slug that's already taken.
+- **Warnings** go to the owner: numbers, client wording, structure differences, post length and hashtags.
