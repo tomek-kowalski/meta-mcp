@@ -34,22 +34,3 @@ export function normalizeUrl(href: string, base: string, origin: string): Normal
 export function isPageCandidate(n: NormalizedUrl): boolean {
   return n.sameOrigin && !ASSET.test(n.path) && !n.path.startsWith("/api/") && n.path !== "/api";
 }
-
-/** Evidence file for a URL, relative to evidence/pages/: <lang>/<path without the language prefix>.md */
-export function evidenceFileFor(url: string, lang: string): string {
-  const { pathname } = new URL(url);
-  let segments = pathname.split("/").filter(Boolean).map(safeSegment);
-  if (segments[0] === lang) segments = segments.slice(1);
-  const name = segments.length ? segments.join("/") : "index";
-  return `${safeSegment(lang)}/${name}.md`;
-}
-
-function safeSegment(segment: string): string {
-  let decoded = segment;
-  try {
-    decoded = decodeURIComponent(segment);
-  } catch {
-    /* keep raw */
-  }
-  return decoded.normalize("NFC").replace(/[^\p{L}\p{N}._-]+/gu, "_").replace(/^\.+/, "_") || "_";
-}

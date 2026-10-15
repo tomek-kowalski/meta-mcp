@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmdirSync, rmSync, symlinkSync, unlinkSync } fr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigError, PROJECT_ROOT } from "../src/config.js";
-import { parseOrigin, parseTextResources, readKnowledgeConfig, resolveKnowledgeDir } from "../src/knowledge/config.js";
+import { parseExtraPaths, parseOrigin, readKnowledgeConfig, resolveKnowledgeDir } from "../src/knowledge/config.js";
 import { writeGenerated } from "../src/knowledge/store.js";
 
 const sandbox = mkdtempSync(join(tmpdir(), "knowledge-cfg-"));
@@ -83,12 +83,10 @@ test("site origin: normalized to the origin; invalid values rejected", () => {
   assert.throws(() => parseOrigin("ftp://example.com"), ConfigError);
 });
 
-test("text resources parse as path=lang; malformed entries are rejected", () => {
-  assert.deepEqual(parseTextResources("/llms.txt=en, /humans.txt=pl"), [
-    { path: "/llms.txt", lang: "en" },
-    { path: "/humans.txt", lang: "pl" },
-  ]);
-  assert.throws(() => parseTextResources("llms.txt"), ConfigError);
+test("extra paths parse as a comma-separated list; malformed entries are rejected", () => {
+  assert.deepEqual(parseExtraPaths("/opinia, /x/y"), ["/opinia", "/x/y"]);
+  assert.deepEqual(parseExtraPaths(undefined), []);
+  assert.throws(() => parseExtraPaths("opinia"), ConfigError);
 });
 
 test("the crawl delay can't go below two seconds", () => {
@@ -97,11 +95,10 @@ test("the crawl delay can't go below two seconds", () => {
   assert.throws(() => readKnowledgeConfig(env({ KNOWLEDGE_MIN_DELAY_MS: "500" })), ConfigError);
 });
 
-test("generated writes are confined to evidence/ and reports/", () => {
+test("generated writes are confined to evidence/", () => {
   const root = join(sandbox, "kb");
   writeGenerated(root, join(root, "evidence", "urls.json"), "{}\n");
-  writeGenerated(root, join(root, "reports", "r.md"), "x\n");
-  for (const target of ["claims.json", join("facts", "services.md"), join("recommendations", "x.md"), join("..", "elsewhere.md")]) {
+  for (const target of ["README.md", join("reports", "r.md"), join("..", "elsewhere.md")]) {
     assert.throws(() => writeGenerated(root, join(root, target), "x"), /Refusing to write/, target);
   }
 });

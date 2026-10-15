@@ -1,26 +1,23 @@
 import type { CrawlResult, PageOutcome } from "./crawler.js";
-import { contentHash, sectionHash, sha256 } from "./extract.js";
 import type { UrlRecord, UrlRegistry } from "./schema.js";
-import { sectionsOf } from "./snapshot.js";
-import { evidenceFileFor } from "./urls.js";
+import { normalizeUrl } from "./urls.js";
 
 /**
- * Merges a crawl into the published-URL registry.
+ * Merges a crawl into the registry of published URLs.
  *
- * Preservation rules:
  * - A failed request (network, timeout, browser error, 5xx) never removes a
- *   URL and never replaces its evidence; it records last_error only.
+ *   URL; it only records last_error.
  * - A URL is marked removed only after a successful check says it's gone:
- *   HTTP 404/410, or (for a client-rendered site) it now resolves to another
- *   page and the sitemap no longer lists it.
+ *   HTTP 404/410, or (client-rendered site) it now resolves to another page
+ *   and the sitemap no longer lists it.
  * - URLs the crawl didn't reach (--limit, robots, cap) stay untouched.
  */
 
+export type ChangeKind = "added" | "verified" | "removed" | "restored" | "alias" | "failed";
+
 export interface PageChange {
   url: string;
-  lang: string;
-  kind: "added" | "changed" | "unchanged" | "removed" | "alias" | "failed" | "restored";
-  previous?: UrlRecord;
+  kind: ChangeKind;
   record: UrlRecord;
   outcome: PageOutcome;
 }
@@ -33,15 +30,11 @@ export interface MergeResult {
 const blank = (url: string, at: string): UrlRecord => ({
   url,
   lang: "und",
-  kind: "page",
   http_status: null,
   canonical: null,
   alias_of: null,
   hreflang: {},
   anchors: [],
-  sections: {},
-  content_sha256: null,
-  evidence_file: null,
   first_seen: at,
   last_seen: at,
   last_verified: null,
@@ -52,93 +45,68 @@ const blank = (url: string, at: string): UrlRecord => ({
 export function mergeCrawl(previous: UrlRegistry, crawl: CrawlResult, origin: string): MergeResult {
   const at = crawl.finishedAt;
   const byUrl = new Map(previous.urls.map((r) => [r.url, { ...r }]));
-  const inSitemap = new Set(crawl.sitemapUrls.map((u) => u.replace(/\/+$/, "") || u));
+  const inSitemap = new Set(crawl.sitemapUrls.map((u) => normalizeUrl(u, origin, origin)?.url ?? u));
   const changes: PageChange[] = [];
+  const record = (url: string, kind: ChangeKind, rec: UrlRecord, outcome: PageOutcome) => {
+    byUrl.set(url, rec);
+    changes.push({ url, kind, record: rec, outcome });
+  };
 
   for (const outcome of crawl.outcomes) {
     const prev = byUrl.get(outcome.url);
-    const record: UrlRecord = prev ? { ...prev } : blank(outcome.url, at);
+    const rec: UrlRecord = prev ? { ...prev } : blank(outcome.url, at);
 
     if (!outcome.ok) {
-      const gone = outcome.status === 404 || outcome.status === 410;
-      if (gone && prev && !prev.removed_at) {
-        record.http_status = outcome.status;
-        record.removed_at = at;
-        record.last_verified = at;
-        record.last_error = null;
-        byUrl.set(record.url, record);
-        changes.push({ url: record.url, lang: record.lang, kind: "removed", previous: prev, record, outcome });
-      } else if (prev) {
-        record.last_error = { at, message: outcome.error };
-        byUrl.set(record.url, record);
-        changes.push({ url: record.url, lang: record.lang, kind: "failed", previous: prev, record, outcome });
+      if (!prev) {
+        changes.push({ url: outcome.url, kind: "failed", record: rec, outcome }); // nothing to keep
+      } else if ((outcome.status === 404 || outcome.status === 410) && !prev.removed_at) {
+        record(rec.url, "removed", { ...rec, http_status: outcome.status, removed_at: at, last_verified: at, last_error: null }, outcome);
       } else {
-        // Never seen and failing: nothing to preserve, nothing to add.
-        changes.push({ url: outcome.url, lang: "und", kind: "failed", record, outcome });
+        record(rec.url, "failed", { ...rec, last_error: { at, message: outcome.error } }, outcome);
       }
       continue;
     }
 
-    record.last_seen = at;
-    record.last_verified = at;
-    record.last_error = null;
+    const { extract } = outcome;
+    const target = extract.canonical && extract.canonical !== outcome.url ? extract.canonical : outcome.finalUrl !== outcome.url ? outcome.finalUrl : null;
+    Object.assign(rec, {
+      lang: extract.lang ?? rec.lang,
+      http_status: outcome.status,
+      canonical: extract.canonical,
+      hreflang: extract.hreflang,
+      last_seen: at,
+      last_verified: at,
+      last_error: null,
+    });
 
-    if (outcome.kind === "text") {
-      record.kind = "text";
-      record.lang = outcome.lang;
-      record.http_status = outcome.status;
-      record.canonical = outcome.url;
-      record.alias_of = null;
-      record.sections = { _text: sectionHash({ heading: null, blocks: [outcome.text] }) };
-      record.content_sha256 = sha256(outcome.text);
-      record.evidence_file = evidenceFileFor(outcome.url, outcome.lang);
-    } else {
-      const { extract } = outcome;
-      const canonical = extract.canonical;
-      const target = canonical && canonical !== outcome.url ? canonical : outcome.finalUrl !== outcome.url ? outcome.finalUrl : null;
-      record.kind = "page";
-      record.lang = extract.lang ?? record.lang;
-      record.http_status = outcome.status;
-      record.canonical = canonical;
-      record.hreflang = extract.hreflang;
-      if (target) {
-        // An alias, a redirect or a client-side fallback: not publishable itself.
-        const wasPage = prev && !prev.alias_of && !prev.removed_at && prev.content_sha256 !== null;
-        record.alias_of = target;
-        record.anchors = [];
-        record.sections = {};
-        if (wasPage && !inSitemap.has(outcome.url)) {
-          record.removed_at = at;
-          byUrl.set(record.url, record);
-          changes.push({ url: record.url, lang: record.lang, kind: "removed", previous: prev, record, outcome });
-        } else {
-          byUrl.set(record.url, record);
-          changes.push({ url: record.url, lang: record.lang, kind: "alias", previous: prev, record, outcome });
-        }
-        continue;
-      }
-      record.alias_of = null;
-      record.anchors = extract.anchors;
-      record.sections = sectionsOf(extract.sections);
-      record.content_sha256 = contentHash(extract);
-      record.evidence_file = evidenceFileFor(outcome.url, record.lang);
+    if (target) {
+      // An alias, a redirect or a client-side fallback: not publishable itself.
+      const wasPage = prev && !prev.alias_of && !prev.removed_at;
+      Object.assign(rec, { alias_of: target, anchors: [] });
+      if (wasPage && !inSitemap.has(outcome.url)) record(rec.url, "removed", { ...rec, removed_at: at }, outcome);
+      else record(rec.url, "alias", rec, outcome);
+      continue;
     }
-
-    let kind: PageChange["kind"];
-    if (!prev) kind = "added";
-    else if (prev.removed_at) kind = "restored";
-    else kind = prev.content_sha256 === record.content_sha256 ? "unchanged" : "changed";
-    record.removed_at = null;
-    byUrl.set(record.url, record);
-    changes.push({ url: record.url, lang: record.lang, kind, previous: prev, record, outcome });
+    Object.assign(rec, { alias_of: null, anchors: extract.anchors });
+    const kind: ChangeKind = !prev ? "added" : prev.removed_at ? "restored" : "verified";
+    record(rec.url, kind, { ...rec, removed_at: null }, outcome);
   }
 
   return {
-    registry: {
-      version: 1,
-      origin,
-      urls: [...byUrl.values()].sort((a, b) => a.url.localeCompare(b.url)),
-    },
+    registry: { version: 2, origin, urls: [...byUrl.values()].sort((a, b) => a.url.localeCompare(b.url)) },
     changes,
   };
+}
+
+/** The registry entry for a URL (normalized: no fragment, query or trailing slash). */
+export function findRecord(registry: UrlRegistry, url: string): UrlRecord | undefined {
+  const key = registry.origin ? (normalizeUrl(url, registry.origin, registry.origin)?.url ?? url) : url;
+  return registry.urls.find((r) => r.url === key);
+}
+
+/** Age of the last complete crawl; older than staleDays means "refresh recommended". */
+export function freshness(lastCompleteCrawl: string | null, now: Date, staleDays: number) {
+  if (!lastCompleteCrawl) return { lastCompleteCrawl: null, ageDays: null, stale: true };
+  const ageDays = Math.floor((now.getTime() - Date.parse(lastCompleteCrawl)) / 86_400_000);
+  return { lastCompleteCrawl, ageDays, stale: ageDays > staleDays };
 }
