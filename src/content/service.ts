@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { z } from "zod";
 import { ConfigError } from "../config.js";
@@ -22,6 +23,8 @@ export interface ContentDeps {
   pageId: string | null;
   /** Loads the check context; tests replace it */
   context?: (paths: PublisherPaths, name: string) => CheckContext;
+  /** File operations of ingest; tests replace some to simulate failures */
+  fs?: Partial<IngestFs>;
 }
 
 export const ingestOptions = z
@@ -94,8 +97,6 @@ export function ingest(paths: PublisherPaths, input: string, options: IngestOpti
   const lang: Language = opts.lang ?? parsed.language ?? "pl";
   const facebookLang: Language = opts.facebookLang ?? "pl";
   const channelList: Channel[] = opts.channels ?? parsed.channels ?? [...CHANNELS];
-  mkdirSync(existing, { recursive: true });
-  renameSync(file, join(existing, "source.txt")); // moved, byte for byte: the original is kept with its draft
   const state: DraftState = {
     version: 1,
     name,
@@ -110,9 +111,170 @@ export function ingest(paths: PublisherPaths, input: string, options: IngestOpti
     last_error: null,
     history: [{ at: now.toISOString(), status: "VALIDATED", note: `ingested ${fileName}` }],
   };
-  writeState(existing, state);
+  moveIntoDraft(paths, { file, fileName, name, dir: existing, sha256: source.sha256 }, state, { ...REAL_FS, ...deps.fs }, deps);
   logEvent(paths.logsDir, { event: "ingested", name, file: fileName, sha256: source.sha256, bytes: source.bytes, lang, facebook_lang: facebookLang, channels: channelList }, now);
   return { name, file: fileName, state, parsed, sourceSecrets: secretsIn(source.text) };
+}
+
+/** The file operations ingest uses; tests replace them to simulate failures. */
+export interface IngestFs {
+  /** creates one directory; fails if it exists */
+  mkdir: (dir: string) => void;
+  /** removes a directory only if it's empty */
+  rmdir: (dir: string) => void;
+  rename: (from: string, to: string) => void;
+  /** copies; fails if the target exists (never overwrites) */
+  copyExclusive: (from: string, to: string) => void;
+  unlink: (file: string) => void;
+  readFile: (file: string) => Buffer;
+  readdir: (dir: string) => string[];
+  writeState: (dir: string, state: DraftState) => void;
+}
+
+const REAL_FS: IngestFs = {
+  mkdir: (dir) => mkdirSync(dir),
+  rmdir: (dir) => rmdirSync(dir),
+  rename: (from, to) => renameSync(from, to),
+  copyExclusive: (from, to) => copyFileSync(from, to, fsConstants.COPYFILE_EXCL),
+  unlink: (file) => unlinkSync(file),
+  readFile: (file) => readFileSync(file),
+  readdir: (dir) => readdirSync(dir),
+  writeState,
+};
+
+const sha256Of = (buffer: Buffer) => createHash("sha256").update(buffer).digest("hex");
+const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+interface Ingesting {
+  /** where the source is now (the inbox) */
+  file: string;
+  fileName: string;
+  name: string;
+  /** drafts/<name>, not yet existing */
+  dir: string;
+  /** hash of the bytes that were read and parsed */
+  sha256: string;
+}
+
+/**
+ * Moves the source into its new draft folder and writes state.json, all or nothing:
+ *
+ * - the folder is created by this attempt (it must not exist), so only it is ever removed;
+ * - a failed move leaves the source in the inbox (rename is all or nothing) and removes the
+ *   folder if it's still empty;
+ * - after the move, the file is hashed again: it must be exactly the content that was parsed;
+ * - if that check or state.json fails, the source goes back to the inbox with an exclusive copy
+ *   (never over an existing file), verified byte for byte before the moved file is removed;
+ * - when restoring isn't possible, the draft folder is kept and the error names the exact
+ *   path of the source. The only copy of the source is never deleted.
+ */
+function moveIntoDraft(paths: PublisherPaths, src: Ingesting, state: DraftState, fs: IngestFs, deps: ContentDeps): void {
+  mkdirSync(paths.draftsDir, { recursive: true });
+  try {
+    fs.mkdir(src.dir);
+  } catch (err) {
+    throw new ConfigError(`Couldn't create drafts/${src.name} (${reason(err)}). Nothing was moved: "${src.fileName}" is still in the inbox.`);
+  }
+
+  const moved = join(src.dir, "source.txt");
+  try {
+    fs.rename(src.file, moved);
+  } catch (err) {
+    const leftover = removeIfEmpty(src.dir, fs) ? "" : ` Remove the empty folder ${src.dir} before trying again.`;
+    failed(paths, src, `the move failed: ${reason(err)}`, src.file, deps);
+    throw new ConfigError(`Couldn't move "${src.fileName}" into drafts/${src.name} (${reason(err)}). It is still in the inbox: ${src.file}.${leftover}`);
+  }
+
+  let failure: string | null = null;
+  try {
+    if (sha256Of(fs.readFile(moved)) !== src.sha256) failure = "the file changed while it was being ingested";
+  } catch (err) {
+    failure = `the moved file couldn't be read back (${reason(err)})`;
+  }
+  if (failure === null) {
+    try {
+      fs.writeState(src.dir, state);
+      return;
+    } catch (err) {
+      failure = `state.json couldn't be written (${reason(err)})`;
+    }
+  }
+  throw restore(paths, src, moved, failure, fs, deps);
+}
+
+/** Puts the source back in the inbox after a failure past the move. Returns the error to throw. */
+function restore(paths: PublisherPaths, src: Ingesting, moved: string, failure: string, fs: IngestFs, deps: ContentDeps): ConfigError {
+  const keep = (why: string) => {
+    failed(paths, src, `${failure}; ${why}`, moved, deps);
+    return new ConfigError(
+      `Ingesting "${src.fileName}" failed: ${failure}. ${why} The source is kept at ${moved}. ` +
+        `To recover, move it back to ${src.file} yourself, then remove the folder ${src.dir}.`,
+    );
+  };
+
+  // never over an existing file: an exclusive copy fails if one appeared meanwhile
+  try {
+    fs.copyExclusive(moved, src.file);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return keep(code === "EEXIST" ? `A new "${src.fileName}" is in the inbox, so it wasn't overwritten.` : `Restoring it failed too (${reason(err)}).`);
+  }
+
+  // the restored copy must be byte for byte the moved file before the moved one goes
+  let identical = false;
+  try {
+    identical = sha256Of(fs.readFile(src.file)) === sha256Of(fs.readFile(moved));
+  } catch {
+    identical = false;
+  }
+  if (!identical) {
+    try {
+      fs.unlink(src.file); // only the faulty copy; the moved file stays
+    } catch {
+      // both stay: nothing is lost
+    }
+    return keep("The copy back to the inbox couldn't be verified.");
+  }
+
+  try {
+    fs.unlink(moved);
+  } catch (err) {
+    failed(paths, src, `${failure}; restored, but the moved copy couldn't be removed`, src.file, deps);
+    return new ConfigError(
+      `Ingesting "${src.fileName}" failed: ${failure}. It is back in the inbox (${src.file}), but a copy remains at ${moved} (${reason(err)}): ` +
+        `remove the folder ${src.dir} before trying again.`,
+    );
+  }
+
+  // leftovers of this attempt only: an interrupted state.json write, then the folder if it's empty
+  try {
+    for (const f of fs.readdir(src.dir)) if (/^state\.json\.tmp-\d+$/.test(f)) fs.unlink(join(src.dir, f));
+  } catch {
+    // the folder check below reports what's left
+  }
+  const leftover = removeIfEmpty(src.dir, fs) ? "" : ` Remove the leftover folder ${src.dir} before trying again.`;
+  failed(paths, src, failure, src.file, deps);
+  const again = failure.startsWith("the file changed") ? " Ingest it again." : "";
+  return new ConfigError(`Ingesting "${src.fileName}" failed: ${failure}. Nothing was ingested: it is back in the inbox (${src.file}).${again}${leftover}`);
+}
+
+function removeIfEmpty(dir: string, fs: IngestFs): boolean {
+  if (!existsSync(dir)) return true;
+  try {
+    fs.rmdir(dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Logs the failed attempt and where the source is; never fails the ingest itself. */
+function failed(paths: PublisherPaths, src: Ingesting, why: string, sourceAt: string, deps: ContentDeps): void {
+  try {
+    logEvent(paths.logsDir, { event: "ingest_failed", name: src.name, file: src.fileName, sha256: src.sha256, reason: why, source_at: sourceAt }, deps.now());
+  } catch {
+    // the thrown error carries the same information
+  }
 }
 
 // ---- status -----------------------------------------------------------------
