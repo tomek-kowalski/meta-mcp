@@ -1,3 +1,4 @@
+import { svgElementCount, svgErrors, svgText } from "../content/post.js";
 import { normalizeUrl } from "../knowledge/urls.js";
 import type { UrlRegistry } from "../knowledge/schema.js";
 import { LANGUAGES, type Draft, type DraftMeta, type Language } from "./draft.js";
@@ -103,7 +104,8 @@ const NUMBER_CLAIMS: [string, RegExp][] = [
   ["amount of money", /(?:\d[\d\s.,]*\s?(?:zł|PLN|EUR|€|USD|\$)|[$€]\s?\d[\d.,]*)/g],
   ["multiplier", /\b\d+(?:[.,]\d+)?\s?(?:x|×|razy|times|mal)\b/gi],
 ];
-const CASE_STUDY = /case stud|dla klient[ae]|u klienta|nasz(?:ego|ym|emu|ych)? klient|for (?:our|a) client|our clients?\b|für unseren? Kunden|unsere Kunden|testimonial|referencj/i;
+// whole words only: "panelu klienta" is not "u klienta"
+const CASE_STUDY = /(?<!\p{L})(?:case stud|dla klient[ae]|u klienta|nasz(?:ego|ym|emu|ych)? klient|for (?:our|a) client|our clients?(?!\p{L})|für unseren? Kunden|unsere Kunden|testimonial|referencj)/iu;
 const BRAND = /\bfor\s?each\s?url\b/gi;
 const BASE_COM = /base\.com|base\s?linker/i;
 const URL_RE = /https?:\/\/[^\s)\]>"'`]+/g;
@@ -172,7 +174,17 @@ export function checkDraft(draft: Draft, ctx: CheckContext): Finding[] {
     if (post.length > 60000) error("facebook.length", `facebook.${l}.txt is longer than Facebook allows`);
     const hashtags = post.match(/(^|\s)#[\p{L}\p{N}_]+/gu)?.length ?? 0;
     if (hashtags > 3) warn("facebook.hashtags", `facebook.${l}.txt has ${hashtags} hashtags; use at most 3`);
-    if (post.match(URL_RE)) warn("facebook.link", `facebook.${l}.txt contains a URL; the post links its article automatically, keep links out of the text`);
+    if (post.match(URL_RE)) warn("facebook.link", `facebook.${l}.txt contains a URL; the article link is added at the bottom automatically, keep links out of the text`);
+  }
+  // its one image
+  const posted = fbLanguages.some((l) => draft.facebook[l]?.trim());
+  if (posted && draft.image === null) error("image.missing", "image.svg is missing: every Facebook post has one image (1080×1080 SVG in the website's style)");
+  if (draft.image !== null) {
+    for (const problem of svgErrors(draft.image)) error("image.svg", problem, "image.svg");
+    const elements = svgElementCount(draft.image);
+    if (elements > 40) warn("image.busy", `image.svg draws ${elements} elements; keep only what the post needs`, "image.svg");
+    const words = svgText(draft.image).split(/\s+/).filter(Boolean).length;
+    if (words > 12) warn("image.text", `image.svg has ${words} words of text; a few words read best`, "image.svg");
   }
   for (const l of LANGUAGES) {
     if (draft.facebook[l] !== undefined && !fbLanguages.includes(l)) warn("facebook.unused", `facebook.${l}.txt exists but ${l} isn't in meta.json facebook.languages: it won't be posted`);
@@ -188,6 +200,10 @@ export function checkDraft(draft: Draft, ctx: CheckContext): Finding[] {
   for (const l of fbLanguages) {
     const post = draft.facebook[l];
     if (post) texts.push({ where: `facebook.${l}.txt`, lang: l, text: post, prose: post, facebook: true });
+  }
+  if (draft.image !== null && fbLanguages.length) {
+    const words = svgText(draft.image);
+    if (words) texts.push({ where: "image.svg", lang: fbLanguages[0], text: words, prose: words, facebook: true });
   }
 
   for (const t of texts) {

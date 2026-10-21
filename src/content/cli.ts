@@ -1,3 +1,6 @@
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { z } from "zod";
 import { readConfig } from "../config.js";
@@ -6,7 +9,10 @@ import { MetaClient } from "../meta-client.js";
 import { parseNewsPaths } from "../publisher/cli.js";
 import { publisherPaths, type PublisherPaths } from "../publisher/draft.js";
 import { logError, redactString } from "../sanitize.js";
+import { refresh } from "../knowledge/refresh.js";
 import { publishFacebook, type FacebookDeps } from "./facebook.js";
+import { claudeWriter, runFlow, type FlowDeps } from "./flow.js";
+import { IMAGE_FILE, renderSvg } from "./post.js";
 import { channels, language } from "./intake.js";
 import * as service from "./service.js";
 import { publishWebsite, realRunner, type SiteDeps } from "./site-publisher.js";
@@ -16,6 +22,8 @@ import { publishWebsite, realRunner, type SiteDeps } from "./site-publisher.js";
  *
  *   list
  *   ingest <file> [--lang pl|en|de] [--facebook-lang pl|en|de] [--channels website,facebook]
+ *                                              in your own terminal it goes on into review (below)
+ *   review <file>                              Claude writes the drafts, you accept (publish), rewrite or cancel
  *   status <file>
  *   check <file>
  *   submit <file>                              ready for approval: shows exactly what would be published
@@ -71,6 +79,10 @@ export interface CliDeps {
   facebook: () => FacebookDeps;
   /** The owner's terminal; undefined when there is none (then approve refuses) */
   ask?: (question: string) => Promise<string>;
+  /** Overrides for the review flow (tests); default: headless Claude and the real registry refresh */
+  write?: FlowDeps["write"];
+  preview?: FlowDeps["preview"];
+  refreshKnowledge?: FlowDeps["refreshKnowledge"];
 }
 
 export function defaultDeps(env: NodeJS.ProcessEnv = process.env): CliDeps {
@@ -80,8 +92,9 @@ export function defaultDeps(env: NodeJS.ProcessEnv = process.env): CliDeps {
     const res = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(30_000) });
     return { status: res.status, text: await res.text() };
   };
+  const paths = publisherPaths(env);
   return {
-    paths: publisherPaths(env),
+    paths,
     content,
     site: () => {
       const origin = readKnowledgeConfig(env).origin;
@@ -90,6 +103,7 @@ export function defaultDeps(env: NodeJS.ProcessEnv = process.env): CliDeps {
     },
     facebook: () => ({
       fetchText,
+      renderImage: (svg) => renderSvg(svg, paths.portfolioDir),
       client: () => {
         if (!config.accessToken) throw new Error("META_ACCESS_TOKEN is not set.");
         return new MetaClient({ token: config.accessToken, apiVersion: config.apiVersion });
@@ -108,6 +122,31 @@ export function defaultDeps(env: NodeJS.ProcessEnv = process.env): CliDeps {
   };
 }
 
+function flowDeps(deps: CliDeps, out: Out): FlowDeps {
+  return {
+    paths: deps.paths,
+    content: deps.content,
+    ask: deps.ask!,
+    write: deps.write ?? claudeWriter(),
+    publishWebsite: (name) => publishWebsite(deps.paths, name, { dryRun: false }, { ...deps.content, ...deps.site() }),
+    publishFacebook: (name) => publishFacebook(deps.paths, name, { dryRun: false }, { ...deps.content, ...deps.facebook() }),
+    refreshKnowledge: deps.refreshKnowledge ?? (async () => (await refresh(readKnowledgeConfig(), { dryRun: false, commit: false }, { log: (l) => out.error(l) })).summary),
+    printSummary: (s) => printSummary(out, s),
+    preview: deps.preview ?? ((name) => previewImage(deps.paths, name)),
+  };
+}
+
+/** Renders image.svg to <draft>/image.png (private preview, not published from there) and opens it. */
+async function previewImage(paths: PublisherPaths, name: string): Promise<string | null> {
+  const svgFile = join(paths.draftsDir, name, IMAGE_FILE);
+  if (!existsSync(svgFile)) return null;
+  const png = join(paths.draftsDir, name, "image.png");
+  writeFileSync(png, await renderSvg(readFileSync(svgFile, "utf8"), paths.portfolioDir));
+  const [cmd, args] = process.platform === "win32" ? ["cmd", ["/c", "start", "", png]] : [process.platform === "darwin" ? "open" : "xdg-open", [png]];
+  spawn(cmd, args as string[], { detached: true, stdio: "ignore" }).on("error", () => {}).unref();
+  return png;
+}
+
 function printSummary(out: Out, s: service.ApprovalSummary) {
   out.log(`\n=== ${s.name}: what would be published ===`);
   out.log(`Channels: ${s.channels.join(", ")}`);
@@ -115,7 +154,7 @@ function printSummary(out: Out, s: service.ApprovalSummary) {
     out.log(`\nArticle (${lang}): ${a.title}\n  ${a.url}\n  ${a.excerpt}`);
   }
   if (s.facebook) {
-    out.log(`\nFacebook post (${s.facebook.lang}) on Page ${s.facebook.page_id ?? "(META_PAGE_ID not set)"}, linking ${s.facebook.link}:`);
+    out.log(`\nFacebook post (${s.facebook.lang}) on Page ${s.facebook.page_id ?? "(META_PAGE_ID not set)"}, image ${s.facebook.image ?? "MISSING"}:`);
     out.log(s.facebook.text.split("\n").map((l) => `  | ${l}`).join("\n"));
   }
   if (s.warnings.length) {
@@ -154,8 +193,18 @@ export async function main(argv: string[], out: Out = stdout, deps: CliDeps = de
       out.log(`Sections found: ${Object.keys(result.parsed.sections).join(", ") || "none (plain text)"}${result.parsed.title ? `; title: ${result.parsed.title}` : ""}`);
       if (result.parsed.ignoredHeaders.length) out.log(`Ignored headers: ${result.parsed.ignoredHeaders.join(", ")}`);
       if (result.sourceSecrets.length) out.log(`WARNING: the source contains ${result.sourceSecrets.join(", ")}; it must not appear in the article or post.`);
-      out.log(`Next: ask Claude to write the drafts for ${result.file} (/publish-article ${result.file}), then npm run content -- check ${result.file}`);
-      return 0;
+      if (!deps.ask) {
+        out.log(`Next: ask Claude to write the drafts for ${result.file} (/publish-article ${result.file}), then npm run content -- check ${result.file}`);
+        return 0;
+      }
+      return runFlow(result.file, out, flowDeps(deps, out));
+    }
+    case "review": {
+      if (!deps.ask) {
+        out.error("review needs your own interactive terminal. Run it yourself: npm run content -- review <file>");
+        return 1;
+      }
+      return runFlow(need(), out, flowDeps(deps, out));
     }
     case "status": {
       const st = service.status(paths, need(), content);
@@ -221,7 +270,7 @@ export async function main(argv: string[], out: Out = stdout, deps: CliDeps = de
       throw new Error("publish needs --channel website or --channel facebook");
     }
     default:
-      out.error(`Unknown command "${command ?? ""}". Use: list | ingest | status | check | submit | approve | reject | publish`);
+      out.error(`Unknown command "${command ?? ""}". Use: list | ingest | review | status | check | submit | approve | reject | publish`);
       return 2;
   }
 }

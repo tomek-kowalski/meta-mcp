@@ -220,7 +220,7 @@ test("client refuses arbitrary paths and credential query params", () => {
   assert.throws(() => new MetaClient({ token: FAKE_TOKEN, apiVersion: "v26.0/../x" }));
 });
 
-test("MetaClient's only write method is postPageFeed", () => {
+test("MetaClient's only write method is postPagePhoto", () => {
   const writes = Object.getOwnPropertyNames(MetaClient.prototype).filter((m) => /post|put|delete|patch|create|update|send|publish/i.test(m));
-  assert.deepEqual(writes, ["postPageFeed"]);
+  assert.deepEqual(writes, ["postPagePhoto"]);
 });

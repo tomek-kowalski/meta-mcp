@@ -7,7 +7,8 @@ import { ConfigError } from "../src/config.js";
 import { cliOptions, main, parseArgs, type CliDeps } from "../src/content/cli.js";
 import { publishFacebook, type PageClient } from "../src/content/facebook.js";
 import { draftName, parseSource, readSourceFile, resolveInboxFile } from "../src/content/intake.js";
-import { approvalValid, canMove, readState } from "../src/content/lifecycle.js";
+import { runFlow, type FlowDeps } from "../src/content/flow.js";
+import { approvalValid, canMove, move, readState, writeState } from "../src/content/lifecycle.js";
 import * as service from "../src/content/service.js";
 import { publishWebsite, type Runner, type SiteDeps } from "../src/content/site-publisher.js";
 import { MetaApiError, MetaClient } from "../src/meta-client.js";
@@ -92,6 +93,7 @@ const FILES = (name: string, facebookLang = "pl") => ({
   "article.pl.md": body("Nieudanych synchronizacji było o 40% mniej."),
   "article.en.md": body("There were 40% fewer failed syncs."),
   "article.de.md": body("Es gab 40% weniger fehlgeschlagene Synchronisierungen."),
+  "image.svg": `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1080"><rect width="1080" height="1080" fill="#0a0416"/><text x="80" y="540" fill="#fff">Ponawianie</text></svg>`,
   [`facebook.${facebookLang}.txt`]: "Gdy API nie odpowiada, zadanie warto ponowić. Pokazujemy jak.",
 });
 
@@ -325,13 +327,16 @@ test("website: failing site checks push nothing; not live in time keeps it unpub
 
 // ---- Facebook ---------------------------------------------------------------------------
 
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0]);
+const fakePng = async (svg: string) => (assert.match(svg, /^<svg/), PNG);
+
 function fakePage(behaviour: ("ok" | "refused" | "network")[] = ["ok"]) {
-  const posted: { message: string; link: string }[] = [];
+  const posted: { message: string; image: Uint8Array }[] = [];
   const existing: { id: string; message: string }[] = [];
   const client: PageClient = {
     getPageAccessToken: async () => "page-token-xyz",
     list: (async () => ({ data: existing, paging: { has_next_page: false } })) as PageClient["list"],
-    postPageFeed: async (_page, post) => {
+    postPagePhoto: async (_page, post) => {
       const mode = behaviour.shift() ?? "ok";
       if (mode === "refused") throw new MetaApiError("(#200) Permissions error", { code: 200 });
       if (mode === "network") {
@@ -354,10 +359,10 @@ async function websiteDone(opts: service.IngestOptions = {}) {
 test("Facebook: refused before the website is live; refused when the article in the post's language isn't live", async () => {
   const s = approvedDraft();
   const page = fakePage();
-  const fb = { client: () => page.client, fetchText: fakeSite(s).site.fetchText };
+  const fb = { client: () => page.client, fetchText: fakeSite(s).site.fetchText, renderImage: fakePng };
   await assert.rejects(publishFacebook(s.paths, s.name, { dryRun: false }, { ...s.deps, ...fb }), /must be live on the website/);
   const done = await websiteDone();
-  const down = { client: () => page.client, fetchText: async () => ({ status: 404, text: "" }) };
+  const down = { client: () => page.client, fetchText: async () => ({ status: 404, text: "" }), renderImage: fakePng };
   await assert.rejects(publishFacebook(done.paths, done.name, { dryRun: false }, { ...done.deps, ...down }), /isn't live/);
   assert.equal(page.posted.length, 0);
 });
@@ -365,13 +370,13 @@ test("Facebook: refused before the website is live; refused when the article in 
 test("Facebook: the post in its one chosen language links the article in that language; dry run posts nothing", async () => {
   const s = await websiteDone({ facebookLang: "en" });
   const page = fakePage();
-  const fb = { client: () => page.client, fetchText: fakeSite(s).site.fetchText };
+  const fb = { client: () => page.client, fetchText: fakeSite(s).site.fetchText, renderImage: fakePng };
   const dry = await publishFacebook(s.paths, s.name, { dryRun: true }, { ...s.deps, ...fb });
   assert.equal(dry.link, `${ORIGIN}/en/news/retrying-jobs`);
   assert.equal(page.posted.length, 0);
   const r = await publishFacebook(s.paths, s.name, { dryRun: false }, { ...s.deps, ...fb });
   assert.equal(r.status, "FACEBOOK_PUBLISHED");
-  assert.deepEqual(page.posted, [{ message: "Gdy API nie odpowiada, zadanie warto ponowić. Pokazujemy jak.", link: `${ORIGIN}/en/news/retrying-jobs` }]);
+  assert.deepEqual(page.posted, [{ message: `Gdy API nie odpowiada, zadanie warto ponowić. Pokazujemy jak.\n\n${ORIGIN}/en/news/retrying-jobs`, image: PNG }], "the link at the bottom, with the image");
   const again = await publishFacebook(s.paths, s.name, { dryRun: false }, { ...s.deps, ...fb });
   assert.equal(again.note, "already posted");
   assert.equal(page.posted.length, 1);
@@ -382,7 +387,7 @@ test("Facebook: the post in its one chosen language links the article in that la
 test("Facebook: a refusal keeps the website published (PARTIALLY_PUBLISHED); a retry posts once", async () => {
   const s = await websiteDone();
   const page = fakePage(["refused", "ok"]);
-  const fb = { client: () => page.client, fetchText: fakeSite(s).site.fetchText };
+  const fb = { client: () => page.client, fetchText: fakeSite(s).site.fetchText, renderImage: fakePng };
   await assert.rejects(publishFacebook(s.paths, s.name, { dryRun: false }, { ...s.deps, ...fb }), /refused the post/);
   const state = readState(join(s.paths.draftsDir, s.name));
   assert.equal(state.status, "PARTIALLY_PUBLISHED");
@@ -395,7 +400,7 @@ test("Facebook: a refusal keeps the website published (PARTIALLY_PUBLISHED); a r
 test("Facebook: a lost answer becomes 'unknown'; the retry finds the post instead of posting twice", async () => {
   const s = await websiteDone();
   const page = fakePage(["network"]);
-  const fb = { client: () => page.client, fetchText: fakeSite(s).site.fetchText };
+  const fb = { client: () => page.client, fetchText: fakeSite(s).site.fetchText, renderImage: fakePng };
   await assert.rejects(publishFacebook(s.paths, s.name, { dryRun: false }, { ...s.deps, ...fb }), /may exist/);
   assert.equal(readState(join(s.paths.draftsDir, s.name)).facebook?.status, "unknown");
   const r = await publishFacebook(s.paths, s.name, { dryRun: false }, { ...s.deps, ...fb });
@@ -454,24 +459,90 @@ test("CLI approve: refused without the owner's terminal; the typed code must mat
   assert.ok(lines.some((l) => l.includes("Facebook post (pl)")) && lines.some((l) => l.includes(`${ORIGIN}/en/news/retrying-jobs`)));
 });
 
-test("MetaClient: the one write posts a form to /<page>/feed with the Page token; a lost answer is flagged", async () => {
-  const requests: { url: string; method: string; body: string; auth: string }[] = [];
-  const ok: typeof fetch = async (url, init) => {
-    requests.push({ url: String(url), method: String(init?.method), body: String(init?.body), auth: String((init?.headers as Record<string, string>).Authorization) });
-    return new Response(JSON.stringify({ id: `${PAGE}_1` }), { status: 200 });
+test("CLI ingest in the owner's terminal: Claude writes, the owner asks for a rewrite, then accepts and it publishes", async () => {
+  const s = sandbox();
+  writeFileSync(join(s.paths.inboxDir, "a.txt"), SOURCE);
+  const deps = content();
+  const writes: (string | null)[] = [];
+  const published: string[] = [];
+  const publishTo = (to: "WEBSITE_PUBLISHED" | "FACEBOOK_PUBLISHED") => (name: string) => {
+    const dir = join(s.paths.draftsDir, name);
+    writeState(dir, move(readState(dir), to, deps.now()));
+    published.push(to);
   };
-  const client = new MetaClient({ token: "system-user-token-123", apiVersion: "v26.0", fetchImpl: ok });
-  assert.deepEqual(await client.postPageFeed(PAGE, { message: "Hej", link: `${ORIGIN}/news/x` }, "page-token-456"), { id: `${PAGE}_1` });
-  assert.equal(requests[0].method, "POST");
-  assert.match(requests[0].url, new RegExp(`/v26\\.0/${PAGE}/feed$`));
-  assert.equal(requests[0].auth, "Bearer page-token-456");
-  assert.equal(new URLSearchParams(requests[0].body).get("link"), `${ORIGIN}/news/x`);
-  await assert.rejects(client.postPageFeed("me", { message: "x", link: `${ORIGIN}/` }, "t"), /Invalid Page ID/);
-  await assert.rejects(client.postPageFeed(PAGE, { message: "x", link: "http://insecure" }, "t"), /https/);
-  const lost = new MetaClient({ token: "system-user-token-123", apiVersion: "v26.0", fetchImpl: async () => { throw new TypeError("fetch failed"); } });
-  await assert.rejects(lost.postPageFeed(PAGE, { message: "x", link: `${ORIGIN}/` }, "t"), (err: unknown) => err instanceof MetaApiError && err.network === true);
+  const answers = ["r", "make it shorter", "000000"]; // a wrong code is asked again, then the right one
+  const ask = async (q: string) => answers.shift() ?? q.match(/(?:Type|match) ([0-9A-F]{6})/)![1];
+  const write: FlowDeps["write"] = async (file, notes) => {
+    writes.push(notes);
+    service.save(s.paths, file, FILES(service.nameOf(file)), deps);
+  };
+  const lines: string[] = [];
+  const out = { log: (l: string) => lines.push(l), error: (l: string) => lines.push(l) };
+  // the real publishers are covered above; here only the order and the gate matter
+  const fd: FlowDeps = {
+    paths: s.paths,
+    content: deps,
+    ask,
+    write,
+    publishWebsite: async (name) => (publishTo("WEBSITE_PUBLISHED")(name), { status: "WEBSITE_PUBLISHED", urls: { pl: `${ORIGIN}/news/x` } }),
+    publishFacebook: async (name) => (publishTo("FACEBOOK_PUBLISHED")(name), { status: "FACEBOOK_PUBLISHED", post_id: `${PAGE}_1` }),
+    refreshKnowledge: async () => "refreshed",
+    printSummary: () => lines.push("SUMMARY"),
+    preview: async () => null,
+  };
+  const r = service.ingest(s.paths, "a.txt", {}, deps);
+  assert.equal(await runFlow("a.txt", out, fd), 0);
+  assert.deepEqual(writes, [null, "make it shorter"]);
+  assert.equal(lines.filter((l) => l === "SUMMARY").length, 2, "shown again after the rewrite");
+  assert.deepEqual(published, ["WEBSITE_PUBLISHED", "FACEBOOK_PUBLISHED"]);
+  assert.equal(readState(join(s.paths.draftsDir, r.name)).status, "FACEBOOK_PUBLISHED");
 });
 
+test("CLI review: Enter publishes nothing; c cancels into rejected/", async () => {
+  const s = sandbox();
+  writeFileSync(join(s.paths.inboxDir, "a.txt"), SOURCE);
+  const deps = content();
+  const r = service.ingest(s.paths, "a.txt", {}, deps);
+  const never = () => {
+    throw new Error("must not publish");
+  };
+  const cli = (answers: string[]): CliDeps => ({
+    paths: s.paths,
+    content: deps,
+    site: never,
+    facebook: never,
+    ask: async () => answers.shift() ?? "",
+    write: async (file) => void service.save(s.paths, file, FILES(service.nameOf(file)), deps),
+    preview: async () => null,
+  });
+  const out = { log: () => {}, error: () => {} };
+  assert.equal(await main(["review", "a.txt"], out, cli([""])), 0);
+  assert.equal(readState(join(s.paths.draftsDir, r.name)).status, "REVIEW");
+  assert.equal(await main(["review", "a.txt"], out, cli(["c", "not now"])), 0);
+  assert.ok(existsSync(join(s.paths.rejectedDir, r.name)));
+});
+
+test("MetaClient: the one write is a multipart photo post to /<page>/photos with the Page token; a lost answer is flagged", async () => {
+  const requests: { url: string; method: string; body: unknown; auth: string }[] = [];
+  const ok: typeof fetch = async (url, init) => {
+    requests.push({ url: String(url), method: String(init?.method), body: init?.body, auth: String((init?.headers as Record<string, string>).Authorization) });
+    return new Response(JSON.stringify({ id: "photo_9", post_id: `${PAGE}_1` }), { status: 200 });
+  };
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2]);
+  const client = new MetaClient({ token: "system-user-token-123", apiVersion: "v26.0", fetchImpl: ok });
+  assert.deepEqual(await client.postPagePhoto(PAGE, { message: `Hej\n\n${ORIGIN}/news/x`, image: png }, "page-token-456"), { id: `${PAGE}_1` });
+  assert.equal(requests[0].method, "POST");
+  assert.match(requests[0].url, new RegExp(`/v26\\.0/${PAGE}/photos$`));
+  assert.equal(requests[0].auth, "Bearer page-token-456");
+  const form = requests[0].body as FormData;
+  assert.equal(form.get("message"), `Hej\n\n${ORIGIN}/news/x`);
+  assert.equal(form.get("published"), "true");
+  assert.equal((form.get("source") as Blob).type, "image/png");
+  await assert.rejects(client.postPagePhoto("me", { message: "x", image: png }, "t"), /Invalid Page ID/);
+  await assert.rejects(client.postPagePhoto(PAGE, { message: "x", image: new Uint8Array([1, 2, 3]) }, "t"), /PNG/);
+  const lost = new MetaClient({ token: "system-user-token-123", apiVersion: "v26.0", fetchImpl: async () => { throw new TypeError("fetch failed"); } });
+  await assert.rejects(lost.postPagePhoto(PAGE, { message: "x", image: png }, "t"), (err: unknown) => err instanceof MetaApiError && err.network === true);
+});
 test("cleanup of sandboxes", () => {
   rmSync(join(tmpdir(), "content-nonexistent"), { recursive: true, force: true });
 });

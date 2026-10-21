@@ -3,25 +3,29 @@ import { ConfigError } from "../config.js";
 import { MetaApiError, type MetaClient } from "../meta-client.js";
 import { contentHash, loadDraft, type PublisherPaths } from "../publisher/draft.js";
 import { logEvent, move, readState, writeState, type DraftState } from "./lifecycle.js";
+import { IMAGE_FILE, postMessage } from "./post.js";
 import { check, type ContentDeps } from "./service.js";
 
 /**
  * Posting an approved draft's Facebook post, after its article is live:
  *
  * - only from WEBSITE_PUBLISHED (or PARTIALLY_PUBLISHED, to retry);
- * - the post is in the one language chosen for it and links the article in
- *   that same language, which must answer 200 with its canonical right now;
+ * - the post is a photo post: image.svg rendered to PNG, captioned with the
+ *   post text and, at the bottom, the article link in the post's language,
+ *   which must answer 200 with its canonical right now;
  * - the state is set to "pending" before the post: a lost answer becomes
  *   "unknown", and the next attempt first looks for the post on the Page
  *   instead of posting twice;
  * - a failure never touches the website (status PARTIALLY_PUBLISHED).
  */
 
-export type PageClient = Pick<MetaClient, "getPageAccessToken" | "postPageFeed" | "list">;
+export type PageClient = Pick<MetaClient, "getPageAccessToken" | "postPagePhoto" | "list">;
 
 export interface FacebookDeps {
   client: () => PageClient;
   fetchText: (url: string) => Promise<{ status: number; text: string }>;
+  /** image.svg → PNG (post.ts renderSvg) */
+  renderImage: (svg: string) => Promise<Uint8Array>;
 }
 
 export interface FacebookResult {
@@ -46,8 +50,9 @@ export async function publishFacebook(paths: PublisherPaths, name: string, optio
   if (!pageId) throw new ConfigError("META_PAGE_ID is not configured: no Page to post to.");
   const lang = state.facebook_lang;
   const draft = loadDraft(paths, name);
-  const message = (draft.facebook[lang] ?? "").trim();
+  const text = (draft.facebook[lang] ?? "").trim();
   const link = state.website?.urls[lang];
+  const message = link ? postMessage(text, link) : text;
 
   if (state.status === "FACEBOOK_PUBLISHED" && state.facebook?.post_id) {
     return { name, dryRun: options.dryRun, status: state.status, lang, link: state.facebook.link, message, page_id: pageId, post_id: state.facebook.post_id, note: "already posted" };
@@ -60,13 +65,15 @@ export async function publishFacebook(paths: PublisherPaths, name: string, optio
   }
   const outcome = check(paths, name, deps);
   if (outcome.errors) throw new ConfigError(`"${name}" now has ${outcome.errors} error(s): nothing was posted.`);
-  if (!message) throw new ConfigError(`facebook.${lang}.txt is empty.`);
+  if (!text) throw new ConfigError(`facebook.${lang}.txt is empty.`);
+  if (draft.image === null) throw new ConfigError(`${IMAGE_FILE} is missing: every post has one image.`);
 
   // the linked article, in the post's language, must be live right now
   const page = await deps.fetchText(link).catch(() => ({ status: 0, text: "" }));
   if (page.status !== 200 || !page.text.includes(`<link rel="canonical" href="${link}">`)) {
     throw new ConfigError(`The ${lang} article ${link} isn't live (HTTP ${page.status || "no answer"}): it must be published before the post.`);
   }
+  const image = await deps.renderImage(draft.image);
   if (options.dryRun) {
     return { name, dryRun: true, status: state.status, lang, link, message, page_id: pageId, post_id: null, note: "dry run: nothing was posted" };
   }
@@ -85,7 +92,7 @@ export async function publishFacebook(paths: PublisherPaths, name: string, optio
   state = { ...state, facebook: { status: "pending", lang, link, post_id: null, attempted_at: now.toISOString(), published_at: null, last_error: null } };
   writeState(dir, state);
   try {
-    const { id } = await client.postPageFeed(pageId, { message, link }, token);
+    const { id } = await client.postPagePhoto(pageId, { message, image }, token);
     return finish(paths, dir, state, id, link, message, pageId, deps);
   } catch (err) {
     const unknown = err instanceof MetaApiError && err.network === true;

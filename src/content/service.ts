@@ -7,6 +7,7 @@ import { loadContext } from "../publisher/cli.js";
 import { LANGUAGES, contentHash, draftMeta, loadDraft, type Draft, type Language, type PublisherPaths } from "../publisher/draft.js";
 import { CHANNELS, channels as channelsSchema, draftName, language, listInbox, parseSource, readSourceFile, resolveInboxFile, type Channel, type ParsedSource } from "./intake.js";
 import { approvalCode, approvalHash, approvalValid, logEvent, move, readState, writeState, type DraftState } from "./lifecycle.js";
+import { IMAGE_FILE, postMessage } from "./post.js";
 
 /**
  * The content workflow, shared by the CLI (npm run content) and the MCP
@@ -33,7 +34,7 @@ export const ingestOptions = z
 export type IngestOptions = z.input<typeof ingestOptions>;
 
 /** The draft files Claude (or the owner) may write. */
-export const DRAFT_FILES = ["meta.json", "case.md", ...LANGUAGES.map((l) => `article.${l}.md`), ...LANGUAGES.map((l) => `facebook.${l}.txt`)];
+export const DRAFT_FILES = ["meta.json", "case.md", ...LANGUAGES.map((l) => `article.${l}.md`), ...LANGUAGES.map((l) => `facebook.${l}.txt`), IMAGE_FILE];
 
 const draftDir = (paths: PublisherPaths, name: string) => join(paths.draftsDir, name);
 
@@ -211,7 +212,8 @@ export interface ApprovalSummary {
   content_sha256: string;
   channels: Channel[];
   article: Record<Language, { title: string; excerpt: string; url: string }>;
-  facebook: { lang: Language; page_id: string | null; text: string; link: string } | null;
+  /** text: exactly what is posted (the post, then its article link); image: image.svg, posted as PNG */
+  facebook: { lang: Language; page_id: string | null; text: string; link: string; image: string | null } | null;
   warnings: Finding[];
 }
 
@@ -225,7 +227,13 @@ export function summary(paths: PublisherPaths, draft: Draft, state: DraftState, 
     channels: state.channels,
     article,
     facebook: state.channels.includes("facebook")
-      ? { lang: state.facebook_lang, page_id: deps.pageId, text: draft.facebook[state.facebook_lang] ?? "", link: article[state.facebook_lang].url }
+      ? {
+          lang: state.facebook_lang,
+          page_id: deps.pageId,
+          text: postMessage(draft.facebook[state.facebook_lang] ?? "", article[state.facebook_lang].url),
+          link: article[state.facebook_lang].url,
+          image: draft.image === null ? null : join(draft.dir, IMAGE_FILE),
+        }
       : null,
     warnings,
   };

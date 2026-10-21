@@ -112,27 +112,31 @@ export class MetaClient {
   }
 
   /**
-   * The only write this client can make: a text/link post on a Page's feed
-   * (POST /{page-id}/feed with message and link), with the Page's own token.
+   * The only write this client can make: a photo post on a Page (POST /{page-id}/photos,
+   * multipart: the PNG, its caption and published=true), with the Page's own token.
    * Returns the new post id. A network failure is thrown with `network: true`
    * (the post may exist: check before retrying).
    */
-  async postPageFeed(pageId: string, post: { message: string; link: string }, pageToken: string): Promise<{ id: string }> {
+  async postPagePhoto(pageId: string, post: { message: string; image: Uint8Array }, pageToken: string): Promise<{ id: string }> {
     if (!/^\d{1,32}$/.test(pageId)) throw new Error("Invalid Page ID");
     if (!post.message.trim()) throw new Error("A post needs a message");
-    if (!/^https:\/\//.test(post.link)) throw new Error("A post link must be an https URL");
-    const form = new URLSearchParams({ message: post.message, link: post.link });
-    const result = (await this.request(`${pageId}/feed`, {}, pageToken, form)) as { id?: unknown };
-    if (typeof result.id !== "string" || !result.id) {
+    if (!isPng(post.image)) throw new Error("A post image must be a PNG");
+    const form = new FormData();
+    form.set("message", post.message);
+    form.set("published", "true");
+    form.set("source", new Blob([new Uint8Array(post.image)], { type: "image/png" }), "image.png");
+    const result = (await this.request(`${pageId}/photos`, {}, pageToken, form)) as { id?: unknown; post_id?: unknown };
+    const id = typeof result.post_id === "string" && result.post_id ? result.post_id : result.id;
+    if (typeof id !== "string" || !id) {
       throw new MetaApiError("Meta answered without a post id: the outcome is unknown", { network: true });
     }
-    return { id: result.id };
+    return { id };
   }
 
-  private async request(path: string, query: Query, tokenOverride?: string, form?: URLSearchParams): Promise<unknown> {
+  private async request(path: string, query: Query, tokenOverride?: string, form?: FormData): Promise<unknown> {
     const url = this.buildUrl(path, query);
-    // the only write allowed is a Page feed post
-    if (form && !/^\d{1,32}\/feed$/.test(path)) throw new Error(`Refusing to write to ${path}`);
+    // the only write allowed is a Page photo post
+    if (form && !/^\d{1,32}\/photos$/.test(path)) throw new Error(`Refusing to write to ${path}`);
     let res: Response;
     try {
       res = await this.fetchImpl(url, {
@@ -140,9 +144,8 @@ export class MetaClient {
         headers: {
           Authorization: `Bearer ${tokenOverride ?? this.token}`,
           Accept: "application/json",
-          ...(form ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
         },
-        ...(form ? { body: form.toString() } : {}),
+        ...(form ? { body: form } : {}),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (err) {
@@ -202,3 +205,6 @@ export class MetaClient {
     };
   }
 }
+
+/** PNG signature: the only image format the photo post sends. */
+const isPng = (b: Uint8Array) => b.length > 8 && [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((v, i) => b[i] === v);

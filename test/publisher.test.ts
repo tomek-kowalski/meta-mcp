@@ -12,6 +12,9 @@ const ORIGIN = "https://example.com";
 const CODE = "```php\nadd_action( 'init', 'boot' );\n\tif ( $x ) {\n\t\treturn;\n\t}\n```";
 const body = (lead: string, extra = "") => `${lead}\n\n## Problem\n\nText.\n\n${CODE}\n\n- one\n- two\n${extra}`;
 
+const SVG = (inner = '<text x="80" y="540" fill="#fff">Ponawianie zadań</text>') =>
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1080"><defs><linearGradient id="g"><stop offset="0" stop-color="#0a0416"/><stop offset="1" stop-color="#131862"/></linearGradient></defs><rect width="1080" height="1080" fill="url(#g)"/>${inner}</svg>`;
+
 function draft(overrides: Partial<Draft> = {}): Draft {
   return {
     id: "2026-10-20-ponawianie-zadan",
@@ -27,6 +30,7 @@ function draft(overrides: Partial<Draft> = {}): Draft {
     },
     bodies: { pl: body("Wstęp."), en: body("Intro."), de: body("Einleitung.") },
     facebook: { pl: "Kiedy zadanie w tle się nie powiedzie, warto je ponowić. Pokazujemy jak." },
+    image: SVG(),
     source: null,
     ...overrides,
   };
@@ -57,6 +61,26 @@ const codes = (findings: ReturnType<typeof checkDraft>, level: "error" | "warnin
 
 test("a complete, clean draft has no errors and no warnings", () => {
   assert.deepEqual(checkDraft(draft(), ctx()), []);
+});
+
+test("the Facebook post needs one safe image.svg; its words are checked like the post", () => {
+  const codes = (d: Draft) => checkDraft(d, ctx()).map((f) => `${f.level}:${f.code}`);
+  assert.ok(codes(draft({ image: null })).includes("error:image.missing"));
+  assert.ok(!codes(draft({ image: null, facebook: {} })).includes("error:image.missing"), "no post, no image needed");
+  for (const bad of ["<script>alert(1)</script>", '<a href="https://evil.example/">x</a>', '<image href="data:image/png;base64,AA"/>', '<rect onload="x()"/>', '<rect fill="url(https://x.example/a.svg)"/>', "<foreignObject/>"]) {
+    assert.ok(codes(draft({ image: SVG(bad) })).includes("error:image.svg"), bad);
+  }
+  assert.ok(codes(draft({ image: SVG().replace('viewBox="0 0 1080 1080"', 'viewBox="0 0 100 100"') })).includes("error:image.svg"));
+  assert.ok(codes(draft({ image: SVG('<text x="1" y="1">Foreachurl</text>') })).includes("error:brand"));
+  assert.ok(codes(draft({ image: SVG('<text x="1" y="1">BaseLinker</text>') })).includes("error:base-com"));
+  assert.ok(codes(draft({ image: SVG(`<text x="1" y="1">${"słowo ".repeat(14)}</text>`) })).includes("warning:image.text"));
+  assert.ok(codes(draft({ image: SVG('<circle r="4"/>'.repeat(45)) })).includes("warning:image.busy"));
+});
+
+test("client wording matches whole words only: 'panelu klienta' is fine, 'u klienta' is not", () => {
+  const warnings = (pl: string) => checkDraft(draft({ bodies: { pl: body(pl), en: body("Intro."), de: body("Einleitung.") } }), ctx()).filter((f) => f.code === "claim.client");
+  assert.equal(warnings("Zamówienia widać w panelu klienta.").length, 0);
+  assert.ok(warnings("Wdrożyliśmy to u klienta.").length > 0);
 });
 
 test("every article needs all three languages; code must be identical in each", () => {
@@ -193,6 +217,7 @@ test("check: loads the draft and context from disk, writes check.json tied to th
   writeFileSync(join(dir, "case.md"), "Private: from a client project, ACME SHOP.");
   for (const l of ["pl", "en", "de"] as const) writeFileSync(join(dir, `article.${l}.md`), d.bodies[l]!);
   writeFileSync(join(dir, "facebook.pl.txt"), d.facebook.pl!);
+  writeFileSync(join(dir, "image.svg"), d.image!);
   writeFileSync(join(editorial, "anonymization.json"), JSON.stringify({ version: 1, clients: ["ACME SHOP"], domains: [], identifiers: [], exclude: [] }));
   writeFileSync(join(portfolio, "src", "components", "News", "articles.json"), "[]");
   writeFileSync(join(portfolio, "src", "components", "News", "categories.js"), 'export const NEWS_CATEGORIES = [{ slug: "integracje", label: "Integracje" }];');

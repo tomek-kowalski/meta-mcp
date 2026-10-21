@@ -16,6 +16,7 @@ import { resolveContentDir, resolveGuardedDir } from "../publisher-config.js";
  *     article.en.md        body, English
  *     article.de.md        body, German
  *     facebook.pl.txt      Facebook post (Polish by default; en/de only when the owner chooses)
+ *     image.svg            the post's one image, 1080×1080, rendered to PNG when posted
  *     check.json           written by the checks
  *     state.json           lifecycle, approval and publication state (src/content/lifecycle.ts)
  *
@@ -54,6 +55,8 @@ export interface Draft {
   meta: DraftMeta;
   bodies: Record<Language, string | null>;
   facebook: Partial<Record<Language, string>>;
+  /** image.svg: the Facebook post's image */
+  image: string | null;
   /** source.txt, when the draft came from the inbox: claims are checked against it */
   source: string | null;
 }
@@ -103,7 +106,7 @@ export function loadDraft(paths: PublisherPaths, id: string): Draft {
     const text = read(join(dir, `facebook.${l}.txt`));
     if (text !== null) facebook[l] = text;
   }
-  return { id, dir, meta: parsed.data, bodies, facebook, source: read(join(dir, "source.txt")) };
+  return { id, dir, meta: parsed.data, bodies, facebook, image: read(join(dir, "image.svg")), source: read(join(dir, "source.txt")) };
 }
 
 export function listDrafts(paths: PublisherPaths): string[] {
@@ -114,11 +117,12 @@ export function listDrafts(paths: PublisherPaths): string[] {
     .sort();
 }
 
-/** sha256 over everything that would be published (meta, bodies, posts): a check or approval is tied to it. */
+/** sha256 over everything that would be published (meta, bodies, posts, image): a check or approval is tied to it. */
 export function contentHash(draft: Draft): string {
   const hash = createHash("sha256");
   hash.update(JSON.stringify(draft.meta));
   for (const l of LANGUAGES) hash.update(`\0article.${l}\0${draft.bodies[l] ?? ""}`);
   for (const l of LANGUAGES) hash.update(`\0facebook.${l}\0${draft.facebook[l] ?? ""}`);
+  if (draft.image !== null) hash.update(`\0image\0${draft.image}`);
   return hash.digest("hex");
 }
